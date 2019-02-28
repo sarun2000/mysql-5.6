@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 # -*- cperl -*-
 
-# Copyright (c) 2004, 2016, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2004, 2017, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -100,6 +100,8 @@ use mtr_unique;
 use mtr_results;
 use IO::Socket::INET;
 use IO::Select;
+
+push @INC, ".";
 
 require "lib/mtr_process.pl";
 require "lib/mtr_io.pl";
@@ -209,6 +211,8 @@ our $opt_ctest= env_or_val(MTR_UNIT_TESTS => -1);
 our $opt_ctest_report;
 # Unit test report stored here for delayed printing
 my $ctest_report;
+our $opt_ctest_path;
+our $opt_symbolizer_path;
 
 # Options used when connecting to an already running server
 my %opts_extern;
@@ -255,6 +259,7 @@ my $baseport;
 # $opt_build_thread may later be set from $opt_port_base
 my $opt_build_thread= $ENV{'MTR_BUILD_THREAD'} || "auto";
 my $opt_port_base= $ENV{'MTR_PORT_BASE'} || "auto";
+my $opt_port_exclude= $ENV{'MTR_PORT_EXCLUDE'} || "none";
 my $build_thread= 0;
 
 my $opt_record;
@@ -1127,6 +1132,7 @@ sub command_line_setup {
              # Specify ports
 	     'build-thread|mtr-build-thread=i' => \$opt_build_thread,
 	     'port-base|mtr-port-base=i'       => \$opt_port_base,
+	     'port-exclude|mtr-port-exclude=s'       => \$opt_port_exclude,
 
              # Test case authoring
              'record'                   => \$opt_record,
@@ -1225,6 +1231,8 @@ sub command_line_setup {
 	     'timediff'                 => \&report_option,
 	     'max-connections=i'        => \$opt_max_connections,
 	     'default-myisam!'          => \&collect_option,
+	     'ctest_path=s'             => \$opt_ctest_path,
+	     'symbolizer_path=s'        => \$opt_symbolizer_path,
 	     'report-times'             => \$opt_report_times,
 	     'result-file'              => \$opt_resfile,
 	     'unit-tests!'              => \$opt_ctest,
@@ -1849,15 +1857,36 @@ sub set_build_thread_ports($) {
   my $thread= shift || 0;
 
   if ( lc($opt_build_thread) eq 'auto' ) {
+    my $lower_bound = 0;
+    my $upper_bound = 0;
+    if ( $opt_port_exclude ne 'none' ) {
+      mtr_report("Port exclusion is $opt_port_exclude");
+      ($lower_bound, $upper_bound) = split(/-/, $opt_port_exclude, 2);
+      if ($lower_bound !~ /^\d+$/ || $upper_bound !~ /^\d+$/) {
+        mtr_error("Port exclusion range $opt_port_exclude is not valid.",
+                  "Range must consist of two integers");
+      }
+      $lower_bound = int($lower_bound / 10 - 1000);
+      $upper_bound = int($upper_bound / 10 - 1000);
+      mtr_report("$lower_bound to $upper_bound");
+      if ($lower_bound > $upper_bound) {
+        mtr_error("Port exclusion range $opt_port_exclude is not valid.",
+                  "Lower bound is larger than upper bound")
+      }
+      mtr_report("Excluding unique ids $lower_bound to $upper_bound");
+    }
+
     my $found_free = 0;
     $build_thread = 300;	# Start attempts from here
 
-    my $build_thread_upper = $build_thread + ($opt_parallel > 39
+    my $build_thread_upper = $build_thread + ($opt_parallel > 79
                              ? $opt_parallel + int($opt_parallel / 4)
-                             : 49);
+                             : 99);
+
     while (! $found_free)
     {
-      $build_thread= mtr_get_unique_id($build_thread, $build_thread_upper);
+      $build_thread= mtr_get_unique_id($build_thread, $build_thread_upper,
+                                       $lower_bound, $upper_bound);
       if ( !defined $build_thread ) {
         mtr_error("Could not get a unique build thread id");
       }
@@ -6591,11 +6620,19 @@ sub run_ctest() {
   # Now, run ctest and collect output
   $ENV{CTEST_OUTPUT_ON_FAILURE} = 1;
 
+  my $ctest= $opt_ctest_path || "ctest";
+
+  my $asan_symbolizer_path = "";
+  if ($opt_symbolizer_path) {
+     $asan_symbolizer_path = "ASAN_SYMBOLIZER_PATH=$opt_symbolizer_path";
+  }
+
   # For ASan builds, add in the leak suppression file
   my $ctest_cmd = join(" ",
+                       $asan_symbolizer_path,
                        "LSAN_OPTIONS=" .
                        "suppressions=$glob_mysql_test_dir/asan.supp",
-                       "ctest $ctest_vs 2>&1");
+                       "$ctest $ctest_vs 2>&1");
   my $ctest_out= `$ctest_cmd`;
   if ($? == $no_ctest && ($opt_ctest == -1 || defined $ENV{PB2WORKDIR})) {
     chdir($olddir);
@@ -6750,6 +6787,8 @@ Options that specify ports
   build-thread=#        Can be set in environment variable MTR_BUILD_THREAD.
                         Set  MTR_BUILD_THREAD="auto" to automatically aquire
                         a build thread id that is unique to current host
+  mtr-port-exclude=#-#  Specify the range of ports to exclude when searching
+  port-exclude=#        for available port ranges to use.
 
 Options for test case authoring
 

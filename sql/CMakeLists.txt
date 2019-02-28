@@ -23,11 +23,6 @@ INCLUDE_DIRECTORIES(
   ${CMAKE_BINARY_DIR}/sql
 )
 
-IF(WITH_ZSTD)
- ADD_DEFINITIONS(-DZSTD)
- ADD_DEFINITIONS(-DHAVE_ZSTD_COMPRESS)
-ENDIF()
-
 IF(WITH_JUNCTION)
   SET(JUNCTION_LIBRARIES ${JUNCTION_LIBRARIES}
       ${WITH_JUNCTION}/lib/libjunction${PIC_EXT}.a)
@@ -124,6 +119,7 @@ SET(SQL_SHARED_SOURCES
   password.c
   procedure.cc 
   protocol.cc
+  query_tag_perf_counter.cc
   records.cc
   rpl_handler.cc
   scheduler.cc 
@@ -278,7 +274,7 @@ SET (BINLOG_SOURCE uuid.cc rpl_gtid_misc.cc
                    rpl_gtid_execution.cc rpl_gtid_mutex_cond_array.cc
                    log_event.cc log_event_old.cc binlog.cc sql_binlog.cc
 		   rpl_filter.cc rpl_record.cc rpl_record_old.cc rpl_utility.cc
-		   rpl_injector.cc)
+		   rpl_injector.cc log_event_wrapper.cc)
 ADD_LIBRARY(binlog ${BINLOG_SOURCE})
 SET (RPL_SOURCE rpl_handler.cc rpl_tblmap.cc)
 ADD_DEPENDENCIES(binlog GenError)

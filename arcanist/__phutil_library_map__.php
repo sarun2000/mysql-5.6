@@ -20,14 +20,13 @@ phutil_register_library_map(array(
     'FacebookMySQLLinter' => 'lint/linter/FacebookMySQLLinter.php',
     'FacebookMySQLPrintfLinter' => 'lint/linter/FacebookMySQLPrintfLinter.php',
     'FacebookMySQLTestResultLinter' => 'lint/linter/FacebookMySQLTestResultLinter.php',
-    'FacebookMySQLWhitespaceLinter' => 'lint/linter/FacebookMySQLWhitespaceLinter.php',
-    'FbcodeCppLinter' => 'lint/linter/FbcodeCppLinter.php',
   ),
   'function' =>
   array(
   ),
   'xmap' =>
   array(
+    'BaseDirectoryScopedFormatLinter' => 'ArcanistLinter',
     'FacebookInnoDBTabLinter' => 'ArcanistLinter',
     'FacebookMySQLArcanistConfiguration' => 'ArcanistConfiguration',
     'FacebookMySQLArcanistLandcastleWorkflow' => 'ArcanistBaseWorkflow',
@@ -38,6 +37,5 @@ phutil_register_library_map(array(
     'FacebookMySQLPrintfLinter' => 'ArcanistLinter',
     'FacebookMySQLTestResultLinter' => 'ArcanistLinter',
     'FacebookMySQLWhitespaceLinter' => 'ArcanistLinter',
-    'FbcodeCppLinter' => 'ArcanistLinter',
   ),
 ));

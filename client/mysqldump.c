@@ -56,6 +56,7 @@
 #include "mysqld_error.h"
 
 #include <welcome_copyright_notice.h> /* ORACLE_WELCOME_COPYRIGHT_NOTICE */
+#include "compress_mysqldump_output.h"
 
 /* Exit codes */
 
@@ -155,6 +156,8 @@ static uint opt_enable_cleartext_plugin= 0;
 static my_bool using_opt_enable_cleartext_plugin= 0;
 static uint opt_mysql_port= 0, opt_master_data;
 static uint opt_slave_data;
+static uint opt_compression_chunk_size = 0;
+static my_bool do_compress = 0;
 static uint my_end_arg;
 static char * opt_mysql_unix_port=0;
 static char *opt_bind_addr = NULL;
@@ -688,6 +691,11 @@ static struct my_option my_long_options[] =
    "Skip dumping table views.",
    &opt_ignore_views, &opt_ignore_views, 0,
    GET_BOOL, OPT_ARG, 0, 0, 0, 0, 0, 0},
+  {"compress-data", OPT_COMPRESS_DATA,
+   "Compress data using ZSTD library and split on chunks of"
+   " specified size in megabytes",
+   &opt_compression_chunk_size, &opt_compression_chunk_size, 0,
+   GET_UINT, OPT_ARG, 0, 0, 0xFFFFFFFFu, 0, 0, 0},
   {0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
 
@@ -729,7 +737,7 @@ static void print_comment(FILE *sql_file, my_bool is_error, const char *format,
     ...   variable number of parameters
 */
 
-static void verbose_msg(const char *fmt, ...)
+void verbose_msg(const char *fmt, ...)
 {
   va_list args;
   DBUG_ENTER("verbose_msg");
@@ -853,9 +861,17 @@ static void write_header(FILE *sql_file, char *db_name)
 
     if (opt_rocksdb_bulk_load)
       fprintf(sql_file,
-              "/*!50601 SELECT count(*) INTO @is_rocksdb_supported FROM"
-              " information_schema.SESSION_VARIABLES WHERE"
-              " variable_name='rocksdb_bulk_load' */;\n"
+              "/*!50601 SELECT count(*) INTO @is_mysql8 FROM"
+              " information_schema.TABLES WHERE"
+              " table_schema='performance_schema' AND"
+              " table_name='session_variables' */;\n"
+              "/*!50601 SET @check_rocksdb = CONCAT("
+              " 'SELECT count(*) INTO @is_rocksdb_supported FROM ',"
+              " IF (@is_mysql8, 'performance', 'information'),"
+              " '_schema.session_variables WHERE"
+              " variable_name=\\'rocksdb_bulk_load\\'') */;\n"
+              "/*!50601 PREPARE s FROM @check_rocksdb */;\n"
+              "/*!50601 EXECUTE s */;\n"
               "/*!50601 SET @enable_bulk_load = IF (@is_rocksdb_supported,"
               " 'SET SESSION rocksdb_bulk_load=1', 'SET @dummy = 0') */;\n"
               "/*!50601 PREPARE s FROM @enable_bulk_load */;\n"
@@ -1098,6 +1114,21 @@ get_one_option(int optid, const struct my_option *opt MY_ATTRIBUTE((unused)),
                                                     opt->name)-1;
       break;
     }
+  case (int) OPT_COMPRESS_DATA:
+    {
+      do_compress = 1;
+      // NO_LINT_DEBUG
+      if (opt_compression_chunk_size == 0)
+      {
+        fprintf(stderr,
+                "%s: --compress-data value must be bigger than zero.\n",
+                my_progname);
+        return(EX_USAGE);
+      }
+      verbose_msg("split data on chunks of %d MB size\n",
+          opt_compression_chunk_size);
+      break;
+    }
   }
   return 0;
 }
@@ -1216,6 +1247,16 @@ static int get_options(int *argc, char ***argv)
   }
   if (tty_password)
     opt_password=get_tty_password(NullS);
+
+  if (do_compress && !path)
+  {
+    // NO_LINT_DEBUG
+    fprintf(stderr,
+            "%s: --compress-data must be used with --tab.\n",
+            my_progname);
+    return(EX_USAGE);
+  }
+
   return(0);
 } /* get_options */
 
@@ -1646,7 +1687,8 @@ static FILE* open_sql_file_for_table(const char* table, int flags)
   FILE* res;
   char filename[FN_REFLEN], tmp_path[FN_REFLEN];
   convert_dirname(tmp_path,path,NullS);
-  res= my_fopen(fn_format(filename, table, tmp_path, ".sql", 4),
+  res= my_fopen(fn_format(filename, table, tmp_path, ".sql",
+                          MYF(MY_UNPACK_FILENAME | MY_APPEND_EXT)),
                 flags, MYF(MY_WME));
   return res;
 }
@@ -4089,7 +4131,7 @@ static void dump_table(char *table, char *db)
     */
     convert_dirname(tmp_path,path,NullS);    
     my_load_path(tmp_path, tmp_path, NULL);
-    fn_format(filename, table, tmp_path, ".txt", MYF(MY_UNPACK_FILENAME));
+    fn_format(filename, table, tmp_path, ".txt", MYF(MY_UNPACK_FILENAME | MY_APPEND_EXT));
 
     /* Must delete the file that 'INTO OUTFILE' will write to */
     my_delete(filename, MYF(0));
@@ -4138,12 +4180,19 @@ static void dump_table(char *table, char *db)
       dynstr_append_checked(&query_string, order_by);
     }
 
+    struct compress_context *compress_ctx = NULL;
+    if (do_compress)
+      compress_ctx = start_pipe_and_compress_output(
+          filename, opt_compression_chunk_size, table);
+
     if (mysql_real_query(mysql, query_string.str, query_string.length))
     {
       DB_error(mysql, "when executing 'SELECT INTO OUTFILE'");
       dynstr_free(&query_string);
       DBUG_VOID_RETURN;
     }
+    if (do_compress)
+      finish_pipe_and_compress_output(compress_ctx);
   }
   else
   {
@@ -4190,6 +4239,9 @@ static void dump_table(char *table, char *db)
       }
       fprintf(md_result_file, "/* ORDERING KEY%s : %s */;\n",
               opt_order_by_primary_desc ? " (DESC)" : "", row[5]);
+      if(res)
+        mysql_free_result(res);
+      dynstr_free(&explain_query_string);
     }
 
     if (!opt_xml && !opt_compact)
@@ -4265,7 +4317,7 @@ static void dump_table(char *table, char *db)
                     "-- FBID table has less than 5 columns.\n");
           } else {
             char type[(strlen(row[stat_field_offset]) +
-                       strlen(row[FBID_IS_DELETED_FIELD]))];
+                       strlen(row[FBID_IS_DELETED_FIELD])) + 1];
             strcpy(type, row[stat_field_offset]);
             strcat(type, row[FBID_IS_DELETED_FIELD]);
             uint length= (lengths[stat_field_offset] +

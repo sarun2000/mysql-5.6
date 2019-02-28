@@ -83,9 +83,17 @@ USE test;
 -- Tracker : SESSION_TRACK_STATE_CHANGE
 -- 1
 
+-- Tracker : SESSION_TRACK_RESP_ATTR
+-- change_db
+-- test
+
 SET @@session.session_track_state_change=OFF;
 # Change database
 USE test;
+-- Tracker : SESSION_TRACK_RESP_ATTR
+-- change_db
+-- test
+
 # reset the session.
 SET @@session.session_track_state_change=ON;
 # Define a user defined variable
@@ -138,6 +146,10 @@ USE test;
 -- Tracker : SESSION_TRACK_STATE_CHANGE
 -- 1
 
+-- Tracker : SESSION_TRACK_RESP_ATTR
+-- change_db
+-- test
+
 # expect 1
 SET @var3= 10;
 -- Tracker : SESSION_TRACK_STATE_CHANGE
@@ -164,6 +176,10 @@ DROP TEMPORARY TABLE test.t1;
 # CASE1: current DB exists in current session
 SET @@session.session_track_state_change=OFF;
 USE test;
+-- Tracker : SESSION_TRACK_RESP_ATTR
+-- change_db
+-- test
+
 SET @@session.session_track_state_change=ON;
 # expect 1
 PREPARE p1 FROM 'SELECT i FROM test.t';
@@ -245,6 +261,28 @@ PREPARE p1 FROM 'SELECT i FROM test.t';
 
 # expect 1
 DEALLOCATE PREPARE p1;
+-- Tracker : SESSION_TRACK_STATE_CHANGE
+-- 1
+
+# reset the session.
+# CASE6: user locks through get_lock()
+SET @@session.session_track_state_change=ON;
+# expect 1
+SELECT GET_LOCK("session_state_change_user_lock", 3);
+GET_LOCK("session_state_change_user_lock", 3)
+1
+-- Tracker : SESSION_TRACK_STATE_CHANGE
+-- 1
+
+# RELEASE_LOCK returns 1 on success, but there should be no tracker
+SELECT RELEASE_LOCK("session_state_change_user_lock");
+RELEASE_LOCK("session_state_change_user_lock")
+1
+# reset the session.
+# CASE7: lock table statements
+SET @@session.session_track_state_change=ON;
+# expect 1
+LOCK TABLES test.t READ;
 -- Tracker : SESSION_TRACK_STATE_CHANGE
 -- 1
 

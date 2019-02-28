@@ -710,6 +710,14 @@ static Sys_var_ulong Sys_binlog_stmt_cache_size(
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
        ON_UPDATE(fix_binlog_stmt_cache_size));
 
+static Sys_var_ulonglong Sys_binlog_rows_event_max_rows(
+       "binlog_rows_event_max_rows",
+       "Max number of rows in a single rows event",
+       GLOBAL_VAR(opt_binlog_rows_event_max_rows),
+       CMD_LINE(OPT_ARG),
+       VALID_RANGE(1, ULONGLONG_MAX), DEFAULT(ULONGLONG_MAX), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0));
+
 static bool check_has_super(sys_var *self, THD *thd, set_var *var)
 {
   DBUG_ASSERT(self->scope() != sys_var::GLOBAL);// don't abuse check_has_super()
@@ -1117,6 +1125,20 @@ static Sys_var_charptr Sys_histogram_step_size_binlog_fsync(
        GLOBAL_VAR(histogram_step_size_binlog_fsync), CMD_LINE(REQUIRED_ARG),
        IN_FS_CHARSET, DEFAULT("16ms"), NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(check_histogram_step_size_syntax));
+
+static bool update_thread_nice_val(sys_var *self, THD *thd,
+                                     set_var *var)
+{
+  return !update_thread_nice_value(var->save_result.string_value.str);
+}
+
+static Sys_var_charptr Sys_thread_nice_value(
+       "thread_nice_value","Input format is threadId:niceValue"
+       " nice value range is -20 to 19",
+       GLOBAL_VAR(thread_nice_value),
+       CMD_LINE(OPT_ARG), IN_SYSTEM_CHARSET, DEFAULT(""),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(update_thread_nice_val));
 
 #ifdef HAVE_REPLICATION
 static bool update_binlog_group_commit_step(sys_var *self, THD *thd,
@@ -1583,6 +1605,13 @@ static Sys_var_ulong Sys_flush_time(
        GLOBAL_VAR(flush_time),
        CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, LONG_TIMEOUT),
        DEFAULT(0), BLOCK_SIZE(1));
+
+static Sys_var_mybool Sys_flush_only_old_cache_entries(
+       "flush_only_old_table_cache_entries",
+       "Enable/disable flushing table and definition cache entries "
+       "policy based on TTL specified by flush_time.",
+       GLOBAL_VAR(flush_only_old_table_cache_entries),
+	   CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
 static Sys_var_ulong Sys_binlog_expire_logs_seconds(
        "binlog_expire_logs_seconds",
@@ -2588,6 +2617,18 @@ static Sys_var_mybool Sys_optimizer_low_limit_heuristic(
       SESSION_VAR(optimizer_low_limit_heuristic),
       CMD_LINE(OPT_ARG), DEFAULT(TRUE));
 
+static Sys_var_mybool Sys_optimizer_force_index_for_range(
+      "optimizer_force_index_for_range",
+      "If enabled, FORCE INDEX will also try to force a range plan.",
+      SESSION_VAR(optimizer_force_index_for_range),
+      CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_optimizer_full_scan(
+      "optimizer_full_scan",
+      "Enable full table and index scans.",
+      SESSION_VAR(optimizer_full_scan),
+      CMD_LINE(OPT_ARG), DEFAULT(TRUE));
+
 static const char *optimizer_switch_names[]=
 {
   "index_merge", "index_merge_union", "index_merge_sort_union",
@@ -2599,6 +2640,7 @@ static const char *optimizer_switch_names[]=
   "subquery_materialization_cost_based",
 #endif
   "use_index_extensions", "skip_scan", "skip_scan_cost_based",
+  "multi_range_groupby",
   "default", NullS
 };
 /** propagates changes to @@engine_condition_pushdown */
@@ -2622,7 +2664,7 @@ static Sys_var_flagset Sys_optimizer_switch(
        " subquery_materialization_cost_based"
 #endif
        ", block_nested_loop, batched_key_access, use_index_extensions"
-       ", skip_scan, skip_scan_cost_based"
+       ", skip_scan, skip_scan_cost_based, multi_range_groupby"
        "} and val is one of {on, off, default}",
        SESSION_VAR(optimizer_switch), CMD_LINE(REQUIRED_ARG),
        optimizer_switch_names, DEFAULT(OPTIMIZER_SWITCH_DEFAULT),
@@ -3267,12 +3309,36 @@ static Sys_var_ulonglong Sys_max_compressed_event_cache_size(
        VALID_RANGE(1, 1000000), DEFAULT(1),
        BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0));
 
+static Sys_var_ulonglong Sys_compressed_event_cache_evict_threshold(
+       "compressed_event_cache_evict_threshold",
+       "Percentage of cache to keep after every FIFO eviction",
+       GLOBAL_VAR(opt_compressed_event_cache_evict_threshold),
+       CMD_LINE(OPT_ARG), VALID_RANGE(0, 100), DEFAULT(60),
+       BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0));
+
+static Sys_var_ulonglong Sys_slave_dump_thread_wait_sleep_usec(
+       "slave_dump_thread_wait_sleep_usec",
+       "Time (in microsecs) to sleep on the master's dump thread before "
+       "waiting for new data on the latest binlog.",
+       GLOBAL_VAR(opt_slave_dump_thread_wait_sleep_usec), CMD_LINE(OPT_ARG),
+       VALID_RANGE(0, LONG_TIMEOUT_NSEC / 1000), DEFAULT(0),
+       BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0));
+
 static Sys_var_mybool Sys_wait_semi_sync_ack(
        "rpl_wait_for_semi_sync_ack",
        "Wait for events to be acked by a semi-sync slave before sending them "
        "to the async slaves",
        GLOBAL_VAR(rpl_wait_for_semi_sync_ack), CMD_LINE(OPT_ARG),
        DEFAULT(FALSE));
+
+static Sys_var_ulonglong Sys_slave_lag_sla_seconds(
+       "slave_lag_sla_seconds",
+       "SLA for slave lag in seconds, any tansaction that violated the SLA "
+       "increments the slave_lag_sla_misses status variable. "
+       "NOTE: This is only available when GTIDs are enabled.",
+       GLOBAL_VAR(opt_slave_lag_sla_seconds),
+       CMD_LINE(OPT_ARG), VALID_RANGE(0, 1000000), DEFAULT(60),
+       BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0));
 
 static Sys_var_uint Sys_general_query_throttling_limit(
        "general_query_throttling_limit", "Start throttling queries if running threads high.",
@@ -5197,25 +5263,13 @@ static Sys_var_double Sys_mts_imbalance_threshold(
 
 static const char *dep_rpl_type_names[]= { "NONE", "TBL", "STMT", NullS };
 
-static bool
-check_mts_dependency_replication(sys_var *self, THD *thd, set_var *var)
-{
-  if (!slave_use_idempotent_for_recovery_options)
-  {
-    my_error(ER_CANT_SET_DEPENDENCY_REPLICATION_WITHOUT_IDEMPOTENT_RECOVERY,
-             MYF(0));
-    return true;
-  }
-  return false;
-}
-
 static Sys_var_enum Sys_mts_dependency_replication(
        "mts_dependency_replication",
        "Use dependency based replication",
        GLOBAL_VAR(opt_mts_dependency_replication),
        CMD_LINE(OPT_ARG), dep_rpl_type_names, DEFAULT(DEP_RPL_NONE),
        NO_MUTEX_GUARD, NOT_IN_BINLOG,
-       ON_CHECK(check_mts_dependency_replication), ON_UPDATE(0));
+       ON_CHECK(0), ON_UPDATE(0));
 
 static Sys_var_ulonglong Sys_mts_dependency_size(
        "mts_dependency_size",
@@ -5630,6 +5684,11 @@ static Sys_var_gtid_executed Sys_gtid_executed(
        "binary log. The session variable contains the set of GTIDs "
        "in the current, ongoing transaction.");
 
+static Sys_var_gtid_committed Sys_gtid_committed(
+       "gtid_committed",
+       "The global variable contains the set of GTIDs committed in the storage "
+       "engine");
+
 static bool check_gtid_purged(sys_var *self, THD *thd, set_var *var)
 {
   DBUG_ENTER("check_gtid_purged");
@@ -5987,6 +6046,41 @@ static Sys_var_mybool Sys_high_priority_ddl(
        SESSION_VAR(high_priority_ddl),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
+static Sys_var_mybool Sys_kill_conflicting_connections(
+    "kill_conflicting_connections",
+    "Setting this session only flag will instruct the the session to kill all "
+    "conflicting connections (effective for admin user only) for any command "
+    "executed by the current session. The connections are killed only after "
+    "waiting for wait_lock_timeout. Only connections holding the lock will be "
+    "killed, but there could be more connections in the queue which will "
+    "take the lock before the current session and the current session will "
+    "wait for 1 more second before aborting if the lock won't be granted.",
+    SESSION_ONLY(kill_conflicting_connections),
+    CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+#ifdef HAVE_JEMALLOC
+#ifndef EMBEDDED_LIBRARY
+static bool enable_jemalloc_heap_profiling(sys_var *self, THD *thd,
+                                           set_var *var)
+{
+  /*false means success*/
+  return !enable_jemalloc_hppfunc(var->save_result.string_value.str);
+}
+
+static Sys_var_charptr Sys_enable_jemalloc_hpp(
+       "enable_jemalloc_hpp",
+       "This will provide options for Jemalloc heap profiling."
+       "On: Activates profiling"
+       "Off: Deactivate profiling"
+       "Dump: Dump a profile",
+       GLOBAL_VAR(enable_jemalloc_hpp), CMD_LINE(OPT_ARG), IN_SYSTEM_CHARSET,
+       DEFAULT("OFF"),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(enable_jemalloc_heap_profiling));
+
+#endif
+#endif
+
 static bool update_session_track_state_change(sys_var *self, THD *thd,
                                               enum_var_type type)
 {
@@ -6003,6 +6097,23 @@ static Sys_var_mybool Sys_session_track_state_change(
        ON_CHECK(0),
        ON_UPDATE(update_session_track_state_change));
 
+static bool update_session_track_response_attributes(sys_var *self, THD *thd,
+                                                     enum_var_type type)
+{
+  DBUG_ENTER("update_session_track_resp_attr");
+  DBUG_RETURN(
+      thd->session_tracker.get_tracker(SESSION_RESP_ATTR_TRACKER)->update(thd));
+}
+
+static Sys_var_mybool Sys_session_track_resp_attrs(
+       "session_track_response_attributes",
+       "Track response attribute'.",
+       SESSION_VAR(session_track_response_attributes),
+       CMD_LINE(OPT_ARG), DEFAULT(TRUE),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(0),
+       ON_UPDATE(update_session_track_response_attributes));
+
 static Sys_var_mybool Sys_improved_dup_key_error(
        "improved_dup_key_error",
        "Include the table name in the error text when receiving a duplicate "
@@ -6016,3 +6127,42 @@ static Sys_var_ulong Sys_session_set_dscp_on_socket(
        SESSION_ONLY(dscp_on_socket),
        NO_CMD_LINE, VALID_RANGE(0, 63), DEFAULT(0), BLOCK_SIZE(1),
        NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_mybool Sys_rpl_slave_flow_control(
+       "rpl_slave_flow_control", "If this is set then underrun and "
+       "overrun based flow control between coordinator and worker threads in "
+       "slave instance will be enabled. Does not affect master instance",
+       GLOBAL_VAR(rpl_slave_flow_control), CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE));
+
+static Sys_var_mybool Sys_fast_integer_to_string(
+       "fast_integer_to_string",
+       "Optimized implementation of integer to string conversion",
+       GLOBAL_VAR(fast_integer_to_string),
+       CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_log_sbr_unsafe_query(
+       "log_sbr_unsafe_query",
+       "Log SBR unsafe query in slow query log.",
+       GLOBAL_VAR(log_sbr_unsafe),
+       CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static bool update_throttle_sbr_unsafe_queries(sys_var *self,
+                                               THD *thd,
+                                               enum_var_type type)
+{
+  // Flush remaining logs
+  log_throttle_sbr_unsafe_query.flush(thd);
+  return false;
+}
+
+static Sys_var_ulong Sys_log_throttle_sbr_unsafe_query(
+       "log_throttle_sbr_unsafe_query",
+       "Log at most this many SBR unsafe queries per minute to the "
+       "slow log. This is useful only when log_sbr_unsafe_query is true",
+       GLOBAL_VAR(opt_log_throttle_sbr_unsafe_queries),
+       CMD_LINE(OPT_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(0), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(0),
+       ON_UPDATE(update_throttle_sbr_unsafe_queries));

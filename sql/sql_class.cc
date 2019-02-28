@@ -65,6 +65,12 @@
 
 #include <mysql/psi/mysql_statement.h>
 
+#include <boost/optional.hpp>
+#include <boost/lexical_cast.hpp>
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <sstream>
+
 #ifdef TARGET_OS_LINUX
 #include <sys/syscall.h>
 #endif // TARGET_OS_LINUX
@@ -259,7 +265,7 @@ PSI_thread *thd_get_psi(THD *thd)
 
   @retval               net_wait_timeout value for thread on THD
 */
-ulong thd_get_net_wait_timeout(THD* thd)
+ulong thd_get_net_wait_timeout(const THD* thd)
 {
   return thd->variables.net_wait_timeout_seconds;
 }
@@ -1713,6 +1719,9 @@ void THD::release_resources()
   mysql_mutex_lock(&LOCK_thd_data);
   m_release_resources_started = 1;
 
+  if (m_explicit_snapshot)
+    set_explicit_snapshot(nullptr);
+
   /* if we are still in admission control, release it */
   if (is_in_ac)
   {
@@ -2092,10 +2101,14 @@ bool THD::kill_shared_locks(MDL_context_owner *ctx_in_use)
   THD *in_use= ctx_in_use->get_thd();
 
   // Only allow super user with ddl command to kill blocking threads
-  if ((this->variables.high_priority_ddl ||
-       lex->high_priority_ddl) &&
-      this->security_ctx->master_access & SUPER_ACL &&
+  if (this->security_ctx->master_access & SUPER_ACL
+      &&
+      (
+        ((this->variables.high_priority_ddl || lex->high_priority_ddl) &&
       support_high_priority(lex->sql_command))
+        || variables.kill_conflicting_connections
+      )
+     )
   {
     mysql_mutex_lock(&in_use->LOCK_thd_data);
     /* process the kill only if thread is not already undergoing any kill
@@ -2875,7 +2888,10 @@ select_export::~select_export()
 static File create_file(THD *thd, char *path, sql_exchange *exchange,
 			IO_CACHE *cache)
 {
-  File file;
+  File file= -1;
+  bool new_file_created= false;
+  MY_STAT stat_arg;
+
   uint option= MY_UNPACK_FILENAME | MY_RELATIVE_PATH;
 
 #ifdef DONT_ALLOW_FULL_LOAD_DATA_PATHS
@@ -2898,25 +2914,42 @@ static File create_file(THD *thd, char *path, sql_exchange *exchange,
     return -1;
   }
 
-  if (!access(path, F_OK))
+  if (my_stat(path, &stat_arg, MYF(0)))
   {
-    my_error(ER_FILE_EXISTS_ERROR, MYF(0), exchange->file_name);
-    return -1;
+    /* Check if file is named pipe */
+    if (MY_S_ISFIFO(stat_arg.st_mode))
+    {
+      if ((file = mysql_file_open(key_select_to_file,
+                            path, O_WRONLY, MYF(MY_WME))) < 0)
+      {
+        return -1;
+      }
+    }
+    else
+    {
+      my_error(ER_FILE_EXISTS_ERROR, MYF(0), exchange->file_name);
+      return -1;
+    }
   }
-  /* Create the file world readable */
-  if ((file= mysql_file_create(key_select_to_file,
-                               path, 0666, O_WRONLY|O_EXCL, MYF(MY_WME))) < 0)
-    return file;
+  else
+  {
+    /* Create the file world readable */
+    if ((file= mysql_file_create(key_select_to_file,
+                                 path, 0666, O_WRONLY|O_EXCL, MYF(MY_WME))) < 0)
+      return file;
+    new_file_created= true;
 #ifdef HAVE_FCHMOD
-  (void) fchmod(file, 0666);			// Because of umask()
+    (void) fchmod(file, 0666);			// Because of umask()
 #else
-  (void) chmod(path, 0666);
+    (void) chmod(path, 0666);
 #endif
+  }
   if (init_io_cache(cache, file, 0L, WRITE_CACHE, 0L, 1, MYF(MY_WME)))
   {
     mysql_file_close(file, MYF(0));
-    /* Delete file on error, it was just created */
-    mysql_file_delete(key_select_to_file, path, MYF(0));
+    /* Delete file on error, if it was just created */
+    if (new_file_created)
+      mysql_file_delete(key_select_to_file, path, MYF(0));
     return -1;
   }
   return file;
@@ -5533,3 +5566,94 @@ bool THD::skip_unique_check()
   return rli_slave && rli_slave->get_skip_unique_check();
 }
 
+/**
+  This function selects which session tracker to use.  If a Srv_session
+  is currently attached to this connection we want to redirect all session
+  tracking information to the Srv_session's tracking structures.
+ */
+Session_tracker* THD::get_tracker() {
+  return attached_srv_session
+      ? &attached_srv_session->get_thd()->session_tracker
+      : &session_tracker;
+}
+
+static std::string net_read_str(const char **ptr)
+{
+  size_t len = net_field_length((uchar**)ptr);
+  const char *str = *ptr;
+  *ptr += len;
+  return std::string(str, len);
+}
+
+static void set_attrs_map(const char *ptr, size_t length,
+                   std::unordered_map<std::string, std::string> &attrs_map)
+{
+  const char *end = ptr + length;
+
+  attrs_map.clear();
+  while (ptr < end)
+  {
+    std::string key = net_read_str(&ptr);
+    std::string value = net_read_str(&ptr);
+    attrs_map[key] = value;
+  }
+
+}
+
+void THD::set_connection_attrs(const char *attrs, size_t length)
+{
+  mysql_mutex_lock(&LOCK_thd_data);
+  set_attrs_map(attrs, length, connection_attrs_map);
+  mysql_mutex_unlock(&LOCK_thd_data);
+}
+
+void THD::set_query_attrs(const char *attrs, size_t length)
+{
+  mysql_mutex_lock(&LOCK_thd_data);
+  set_attrs_map(
+      attrs,
+      length,
+      query_attrs_map);
+  mysql_mutex_unlock(&LOCK_thd_data);
+}
+
+void THD::set_query_attrs(
+    const std::unordered_map<std::string, std::string>& attrs) {
+  mysql_mutex_lock(&LOCK_thd_data);
+  query_attrs_map = attrs;
+  mysql_mutex_unlock(&LOCK_thd_data);
+}
+
+int THD::parse_query_info_attr()
+{
+  static const std::string query_info_key = "query_info";
+
+  auto it = this->query_attrs_map.find(query_info_key);
+  if (it == this->query_attrs_map.end())
+    return 0;
+  ptree root;
+  try
+  {
+    std::istringstream query_info_attr(it->second);
+    boost::property_tree::read_json(query_info_attr, root);
+  }
+  catch(const boost::property_tree::json_parser::json_parser_error& e)
+  {
+    return -1; // invalid json
+  }
+  try
+  {
+    boost::optional<std::string> trace_id =
+        root.get_optional<std::string>("traceid");
+    if (trace_id)
+      this->trace_id = *trace_id;
+    this->query_type = root.get<std::string>("query_type");
+    this->num_queries = root.get<uint64_t>("num_queries");
+  }
+  catch(const boost::property_tree::ptree_error& e)
+  {
+    return -1; // invalid key or value
+  }
+  return 0;
+
+}

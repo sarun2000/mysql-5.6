@@ -62,6 +62,8 @@ int ignored_error_code(int err_code);
 #endif
 class Log_event_wrapper;
 
+// TODO (abhinav): Include the name of the key in this struct to distinguish
+// between two keys with the same value but different names
 struct Dependency_key
 {
   uint key_length= 0;
@@ -1472,6 +1474,10 @@ public:
 
   /* Return start of query time or current time */
 
+  // This variable is set to TRUE for log events which needs be logged
+  // to binlog but should not be applied to the storage engine.
+  my_bool m_binlog_only = FALSE;
+
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
 
 private:
@@ -1604,16 +1610,17 @@ private:
   }
 
   /**
-     Encapsulation for things to be done after adding terminal events to DAG
-     @see Log_event::add_to_dag
+     Encapsulation for things to be done to terminal dependency events
+     @see Log_event::schedule_dep
   */
-  void do_post_begin_event(Relay_log_info *rli, Log_event_wrapper *ev);
-  void do_post_end_event(Relay_log_info *rli, Log_event_wrapper *ev);
+  void handle_terminal_dep_event(Relay_log_info *rli,
+                                 std::shared_ptr<Log_event_wrapper> &ev);
 
   /**
-     Called by @add_to_dag and overloaded if required
+     Called by @schedule_dep to prepare a dependency event
   */
-  virtual void do_add_to_dag(Relay_log_info *rli, Log_event_wrapper *ev);
+  virtual void prepare_dep(Relay_log_info *rli,
+                           std::shared_ptr<Log_event_wrapper> &ev);
 
 public:
 
@@ -1654,10 +1661,10 @@ public:
   virtual bool ends_group()   { return FALSE; }
 
   /**
-     Adds events to a DAG according to write-write dependencies
-     see @mts_dag_replication
+     Adds events to a dep queue according to write-write dependencies
+     see @mts_dependency_replication
   */
-  void add_to_dag(Relay_log_info *rli);
+  void schedule_dep(Relay_log_info *rli);
 
   /**
      Apply the event to the database.
@@ -1792,8 +1799,6 @@ protected:
      non-zero. The caller shall decrease the counter by one.
    */
   virtual enum_skip_reason do_shall_skip(Relay_log_info *rli);
-
-  virtual void prepare(Relay_log_info *rli, Log_event_wrapper *ev);
 
 public:
   void apply_query_event(char *query, uint32 query_length_arg);
@@ -2351,7 +2356,8 @@ public:
 public:        /* !!! Public in this patch to allow old usage */
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
   virtual enum_skip_reason do_shall_skip(Relay_log_info *rli);
-  virtual void do_add_to_dag(Relay_log_info *rli, Log_event_wrapper *ev);
+  virtual void prepare_dep(Relay_log_info *rli,
+                           std::shared_ptr<Log_event_wrapper> &ev);
   virtual int do_apply_event(Relay_log_info const *rli);
   virtual int do_update_pos(Relay_log_info *rli);
 
@@ -3084,7 +3090,8 @@ class Xid_log_event: public Log_event
   virtual bool ends_group() { return TRUE; }
 private:
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
-  virtual void do_add_to_dag(Relay_log_info *rli, Log_event_wrapper *ev);
+  virtual void prepare_dep(Relay_log_info *rli,
+                           std::shared_ptr<Log_event_wrapper> &ev);
   virtual int do_apply_event(Relay_log_info const *rli);
   virtual int do_apply_event_worker(Slave_worker *rli);
   enum_skip_reason do_shall_skip(Relay_log_info *rli);
@@ -4319,7 +4326,7 @@ public:
     return m_rows_buf && m_cols.bitmap;
   }
 
-  uint     m_row_count;         /* The number of rows added to the event */
+  ulonglong     m_row_count;         /* The number of rows added to the event */
 
   const uchar* get_extra_row_data() const   { return m_extra_row_data; }
 
@@ -4519,22 +4526,21 @@ private:
 
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
 public:
-  bool get_keys(Relay_log_info *rli, Log_event_wrapper *ev,
+  bool get_keys(Relay_log_info *rli,
+                std::shared_ptr<Log_event_wrapper> &ev,
                 std::deque<Dependency_key> &keys);
 protected:
-  bool parse_keys(Relay_log_info* rli, Log_event_wrapper *ev,
-                  RPL_TABLE_LIST *table_list,
+  bool parse_keys(Relay_log_info* rli,
+                  std::shared_ptr<Log_event_wrapper> &ev,
+                  TABLE *table,
                   std::deque<Dependency_key>& keys);
-  virtual void prepare(Relay_log_info *rli, Log_event_wrapper *ev);
-#ifndef DBUG_OFF
-  uint check_pk(TABLE *tbl, Relay_log_info *rli, MY_BITMAP *cols);
-#endif
 
 private:
   bool get_table_ref(Relay_log_info *rli, void **memory,
                      RPL_TABLE_LIST **table_list);
   void close_table_ref(THD *thd, RPL_TABLE_LIST *table_list);
-  virtual void do_add_to_dag(Relay_log_info *rli, Log_event_wrapper *ev);
+  virtual void prepare_dep(Relay_log_info *rli,
+                           std::shared_ptr<Log_event_wrapper> &ev);
   virtual int do_apply_event(Relay_log_info const *rli);
   virtual int do_update_pos(Relay_log_info *rli);
   virtual enum_skip_reason do_shall_skip(Relay_log_info *rli);
@@ -4707,10 +4713,6 @@ public:
   friend class Old_rows_log_event;
 
 public:
-  // This variable is set to TRUE for row log events which needs be logged
-  // to binlog but should not be applied to the storage engine.
-  my_bool m_binlog_only = FALSE;
-
   // This is set to TRUE when idempotent mode is used for recovery. When TRUE
   // the event is written to the binlog event if there were idempotent errors.
   my_bool m_force_binlog_idempotent= FALSE;
@@ -5104,6 +5106,7 @@ public:
 #ifdef MYSQL_CLIENT
   virtual void print(FILE *file, PRINT_EVENT_INFO *print_event_info);
 #endif
+
   virtual bool write_data_body(IO_CACHE *file);
 
   virtual Log_event_type get_type_code() { return ROWS_QUERY_LOG_EVENT; }
@@ -5115,20 +5118,46 @@ public:
 
   bool has_trx_meta_data() const
   {
+    std::string str(m_rows_query);
+    if (str.length() < (2 + TRX_META_DATA_HEADER.length() + 2))
+      return false;
     // NOTE: Meta data comment format: /*::TRX_META_DATA::{.. JSON ..}*/
     // so to check if the event contains trx meta data we check if the string
     // "::TRX_META_DATA::" is present after the first two "/*" characters.
-    return std::string(m_rows_query)
+    return str
       .compare(2, TRX_META_DATA_HEADER.length(), TRX_META_DATA_HEADER) == 0;
   }
 
   std::string extract_trx_meta_data() const
   {
     DBUG_ASSERT(has_trx_meta_data());
-    char *json_start= strchr(m_rows_query, '{');
-    char *json_end= strrchr(m_rows_query, '}');
-    DBUG_ASSERT(json_start < json_end);
-    size_t json_len= json_end - json_start + 1;
+
+    const char *comment_start= strstr(m_rows_query, "/*");
+    if (unlikely(comment_start == nullptr))
+    {
+      DBUG_ASSERT(false);
+      return std::string();
+    }
+
+    const char *comment_end= strstr(comment_start, "*/");
+    if (unlikely(comment_end == nullptr))
+    {
+      DBUG_ASSERT(false);
+      return std::string();
+    }
+
+    const char *json_start= comment_start + 2 + TRX_META_DATA_HEADER.length();
+    const char *json_end= comment_end - 1;
+    if (unlikely(json_start[0] != '{' ||
+                 json_end[0] != '}' ||
+                 json_start >= json_end))
+    {
+      DBUG_ASSERT(false);
+      return std::string();
+    }
+
+    const size_t json_len= json_end - json_start + 1;
+    DBUG_ASSERT(json_len > 2);
     return std::string(json_start, json_len);
   }
 
@@ -5261,7 +5290,8 @@ public:
 #endif
 
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
-  void do_add_to_dag(Relay_log_info *rli, Log_event_wrapper *ev);
+  void prepare_dep(Relay_log_info *rli,
+                   std::shared_ptr<Log_event_wrapper> &ev);
   int do_apply_event(Relay_log_info const *rli);
   int do_update_pos(Relay_log_info *rli);
   void set_last_gtid(char *last_gtid);

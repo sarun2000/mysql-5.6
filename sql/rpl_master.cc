@@ -45,6 +45,8 @@ my_bool opt_sporadic_binlog_dump_fail = 0;
 ulong rpl_event_buffer_size;
 uint rpl_send_buffer_size = 0;
 
+
+/* Cache for compressed events and associated structures */
 struct binlog_comp_event
 {
   std::shared_ptr<uchar> buff;
@@ -61,12 +63,11 @@ struct binlog_comp_event
   }
 };
 
-/* Cache for compressed events and associated structures */
 #ifdef HAVE_JUNCTION
 
 typedef junction::ConcurrentMap_Grampa<ulonglong, binlog_comp_event*>
                                                                comp_event_cache;
-#define COMP_EVENT_CACHE_NUM_SHARDS 1 // no need to shard lock free hash table
+#define COMP_EVENT_CACHE_NUM_SHARDS 32
 static mysql_mutex_t LOCK_comp_event_cache[COMP_EVENT_CACHE_NUM_SHARDS];
 #ifdef HAVE_PSI_INTERFACE
 static PSI_mutex_key key_LOCK_comp_event_cache[COMP_EVENT_CACHE_NUM_SHARDS];
@@ -98,7 +99,8 @@ static std::atomic<time_t> cache_stats_timer;
 static comp_event_queue comp_event_queue_list[COMP_EVENT_CACHE_NUM_SHARDS];
 
 // size of value part of the compressed event cache in MB
-static std::atomic<size_t> comp_event_cache_size;
+static std::atomic<size_t>
+        comp_event_cache_size_list[COMP_EVENT_CACHE_NUM_SHARDS];
 
 
 static std::pair<std::string, my_off_t> last_acked;
@@ -109,6 +111,9 @@ static PSI_mutex_key key_LOCK_last_acked;
 static PSI_cond_key key_COND_last_acked;
 #endif
 static bool semi_sync_last_ack_inited= false;
+
+// defined in plugin/semisync/semisync_master.cc
+extern char rpl_semi_sync_master_enabled;
 
 #ifndef DBUG_OFF
 static int binlog_dump_count = 0;
@@ -208,20 +213,46 @@ void destroy_semi_sync_last_acked()
   }
 }
 
-static void wait_for_semi_sync_ack(const LOG_POS_COORD *const coord)
+static bool wait_for_semi_sync_ack(const LOG_POS_COORD *const coord)
 {
-  auto current= std::make_pair(std::string(coord->file_name), coord->pos);
+  const auto current= std::make_pair(std::string(coord->file_name), coord->pos);
+  PSI_stage_info old_stage;
+
   mysql_mutex_lock(&LOCK_last_acked);
-  // case: wait till this log pos is >= to the last acked log pos
-  while (current > last_acked)
-    mysql_cond_wait(&COND_last_acked, &LOCK_last_acked);
-  mysql_mutex_unlock(&LOCK_last_acked);
+  current_thd->ENTER_COND(&COND_last_acked,
+                          &LOCK_last_acked,
+                          &stage_slave_waiting_semi_sync_ack,
+                          &old_stage);
+  // TODO: there is a potential race here between global vars
+  // (rpl_semi_sync_mater_enabled and rpl_wait_for_semi_sync_ack) being updated
+  // and this thread going to conditional sleep, that's why we're looping on a 1
+  // sec timedwait. All of this should be inside the semi-sync plugin but none
+  // of the plugin callbacks are called for async threads, so this is the only
+  // viable workaround.
+  // case: wait till this log pos is <= to the last acked log pos, or if waiting
+  // is not required anymore
+  while (!current_thd->killed &&
+         rpl_semi_sync_master_enabled &&
+         rpl_wait_for_semi_sync_ack &&
+         current > last_acked)
+  {
+    ++repl_semi_sync_master_ack_waits;
+    // wait for an ack for 1 second, then retry if applicable
+    struct timespec abstime;
+    set_timespec(abstime, 1);
+    mysql_cond_timedwait(&COND_last_acked, &LOCK_last_acked, &abstime);
+  }
+  current_thd->EXIT_COND(&old_stage);
+
+  // return true only if we're alive i.e. we came here because we received a
+  // successful ACK or if an ACK is no longer required
+  return !current_thd->killed;
 }
 
 static void signal_semi_sync_ack(const LOG_POS_COORD *const acked_coord)
 {
-  auto acked= std::make_pair(std::string(acked_coord->file_name),
-                             acked_coord->pos);
+  const auto acked= std::make_pair(std::string(acked_coord->file_name),
+                                   acked_coord->pos);
   mysql_mutex_lock(&LOCK_last_acked);
   if (acked > last_acked)
   {
@@ -231,13 +262,13 @@ static void signal_semi_sync_ack(const LOG_POS_COORD *const acked_coord)
   mysql_mutex_unlock(&LOCK_last_acked);
 }
 
-static void evict_compressed_events(comp_event_cache &comp_cache,
-                                    comp_event_queue &comp_queue,
+static void evict_compressed_events(ulonglong shard,
                                     ulonglong max_cache_size);
 
 void init_compressed_event_cache()
 {
   for (int i = 0; i < COMP_EVENT_CACHE_NUM_SHARDS; ++i)
+  {
 #ifdef HAVE_JUNCTION
     mysql_mutex_init(key_LOCK_comp_event_cache[i],
                      &LOCK_comp_event_cache[i],
@@ -245,8 +276,10 @@ void init_compressed_event_cache()
 #else
     mysql_rwlock_init(key_LOCK_comp_event_cache[i], &LOCK_comp_event_cache[i]);
 #endif
+    comp_event_cache_size_list[i]= 0;
+  }
   comp_event_cache_inited= true;
-  cache_hit_count= cache_miss_count= comp_event_cache_size= 0;
+  cache_hit_count= cache_miss_count= 0;
   cache_stats_timer= my_time(0);
 }
 
@@ -259,18 +292,18 @@ void clear_compressed_event_cache()
 #else
     mysql_rwlock_wrlock(&LOCK_comp_event_cache[i]);
 #endif
-    evict_compressed_events(comp_event_cache_list[i],
-                            comp_event_queue_list[i], 0);
-    cache_hit_count= cache_miss_count= comp_event_cache_size= 0;
-    cache_stats_timer= my_time(0);
-    comp_event_cache_hit_ratio= 0;
+    evict_compressed_events(i, 0);
     DBUG_ASSERT(comp_event_queue_list[i].empty());
 #ifdef HAVE_JUNCTION
     mysql_mutex_unlock(&LOCK_comp_event_cache[i]);
 #else
     mysql_rwlock_unlock(&LOCK_comp_event_cache[i]);
 #endif
+    DBUG_ASSERT(comp_event_cache_size_list[i] == 0);
   }
+  cache_hit_count= cache_miss_count= 0;
+  cache_stats_timer= my_time(0);
+  comp_event_cache_hit_ratio= 0;
 }
 
 void free_compressed_event_cache()
@@ -281,11 +314,14 @@ void free_compressed_event_cache()
   {
     clear_compressed_event_cache();
     for (int i = 0; i < COMP_EVENT_CACHE_NUM_SHARDS; ++i)
+    {
 #ifdef HAVE_JUNCTION
+      junction::DefaultQSBR.flush();
       mysql_mutex_destroy(&LOCK_comp_event_cache[i]);
 #else
       mysql_rwlock_destroy(&LOCK_comp_event_cache[i]);
 #endif
+    }
     comp_event_cache_inited= false;
   }
 }
@@ -372,6 +408,15 @@ void unregister_slave(THD* thd, bool only_mine, bool need_lock_slave_list)
   }
 }
 
+static bool is_semi_sync_slave(THD *thd)
+{
+  uchar name[] = "rpl_semi_sync_slave";
+  my_bool null_value;
+
+  user_var_entry *entry =
+    (user_var_entry*) my_hash_search(&thd->user_vars, name, sizeof(name) - 1);
+  return entry ? entry->val_int(&null_value) : 0;
+}
 
 /**
   Execute a SHOW SLAVE HOSTS statement.
@@ -400,6 +445,9 @@ bool show_slave_hosts(THD* thd)
   field_list.push_back(new Item_return_int("Master_id", 10,
 					   MYSQL_TYPE_LONG));
   field_list.push_back(new Item_empty_string("Slave_UUID", UUID_LENGTH));
+  field_list.push_back(new Item_return_int("Is_semi_sync_slave", 7,
+                                           MYSQL_TYPE_LONG));
+  field_list.push_back(new Item_empty_string("Replication_status", 20));
 
   if (protocol->send_result_set_metadata(&field_list,
                             Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
@@ -425,6 +473,14 @@ bool show_slave_hosts(THD* thd)
     String slave_uuid;
     if (get_slave_uuid(si->thd, &slave_uuid))
       protocol->store(slave_uuid.c_ptr_safe(), &my_charset_bin);
+
+    protocol->store(is_semi_sync_slave(si->thd));
+    char *replication_status = si->thd->query();
+    if (replication_status)
+      protocol->store(replication_status, &my_charset_bin);
+    else
+      protocol->store("", &my_charset_bin);
+
     if (protocol->write())
     {
       mysql_mutex_unlock(&LOCK_slave_list);
@@ -530,7 +586,7 @@ static binlog_comp_event compress_event(NET *net, const String *packet)
                                     my_free);
 
   // case: malloc failed
-  if (!comp_event) return binlog_comp_event();
+  if (unlikely(!comp_event)) return binlog_comp_event();
 
   // copy the original event in the buffer, compression will happen in place
   memcpy(comp_event.get() + COMP_EVENT_HEADER_SIZE, event, event_len);
@@ -565,17 +621,21 @@ static binlog_comp_event compress_event(NET *net, const String *packet)
   return binlog_comp_event(comp_event, comp_event_len);
 }
 
-static void evict_compressed_events(comp_event_cache &comp_cache,
-                                    comp_event_queue &comp_queue,
-                                    ulonglong max_cache_size)
+static void evict_compressed_events(ulonglong shard,
+                                    ulonglong max_cache_shard_size)
 {
+  auto& comp_cache= comp_event_cache_list[shard];
+  auto& comp_queue= comp_event_queue_list[shard];
+  auto& comp_event_cache_size= comp_event_cache_size_list[shard];
+
   // case: the cache is not full yet short-circuit
-  if (comp_event_cache_size <= max_cache_size)
+  if (likely(comp_event_cache_size <= max_cache_shard_size))
     return;
 
+  auto threshold= max_cache_shard_size *
+    ((double) opt_compressed_event_cache_evict_threshold / 100);
   // old event eviction
-  while ((comp_event_cache_size > max_cache_size * 0.6) &&
-      !comp_queue.empty())
+  while ((comp_event_cache_size > threshold) && !comp_queue.empty())
   {
     ulonglong key;
     size_t size;
@@ -583,16 +643,40 @@ static void evict_compressed_events(comp_event_cache &comp_cache,
     comp_queue.pop();
 #ifdef HAVE_JUNCTION
     auto value= comp_cache.erase(key);
+    DBUG_ASSERT(value->len == size);
     DBUG_ASSERT(value != NULL);
     junction::DefaultQSBR.enqueue(&binlog_comp_event::destroy, value);
 #else
     DBUG_ASSERT(comp_cache.count(key));
     auto value= comp_cache.at(key);
+    DBUG_ASSERT(value->len == size);
+    DBUG_ASSERT(value != NULL);
     comp_cache.erase(key);
     delete value;
 #endif
-    DBUG_ASSERT(comp_event_cache_size > size);
+    DBUG_ASSERT(comp_event_cache_size >= size);
     comp_event_cache_size-= size;
+  }
+}
+
+static void update_comp_event_cache_counters()
+{
+  // case: one minute is up since the last stats update, re-calculate
+  if (unlikely(difftime(my_time(0), cache_stats_timer) >= 60))
+  {
+    auto local_hit_count= cache_hit_count.load();
+    auto local_miss_count= cache_miss_count.load();
+    if (unlikely(local_hit_count + local_miss_count == 0))
+    {
+      comp_event_cache_hit_ratio= 0;
+    }
+    else
+    {
+      comp_event_cache_hit_ratio=
+        (double) local_hit_count / (local_hit_count + local_miss_count);
+    }
+    cache_hit_count= cache_miss_count= 0;
+    cache_stats_timer= my_time(0);
   }
 }
 
@@ -614,7 +698,7 @@ static binlog_comp_event get_compressed_event(NET *net,
                     *static_cast<junction::QSBR::Context*>(net->qsbr_context));
               });
 
-  if (!cache)
+  if (unlikely(!cache))
     return compress_event(net, packet);
 
   ulong file_num= strtoul(strrchr(coord->file_name, '.') + 1, NULL, 10);
@@ -622,9 +706,9 @@ static binlog_comp_event get_compressed_event(NET *net,
   // case: file num can't fit in 20 bits or pos can't fit in 41 bits or comp lib
   // can't fit in 2 bits, so we cannot create a 64 bit integer key for this
   // event
-  if (file_num >= ((ulonglong) 1 << 21) ||
-      coord->pos >= ((ulonglong) 1 << 42) ||
-      net->comp_lib >= ((ulonglong) 1 << 3))
+  if (unlikely(file_num >= ((ulonglong) 1 << 21) ||
+               coord->pos >= ((ulonglong) 1 << 42) ||
+               (ulonglong)net->comp_lib >= ((ulonglong) 1 << 3)))
   {
     sql_print_warning("Not caching binlog event %s:%llu because the cache key "
                       "is out of bounds", coord->file_name, coord->pos);
@@ -641,17 +725,18 @@ static binlog_comp_event get_compressed_event(NET *net,
   binlog_comp_event comp_event;
 
   // get cache, queue and corresponding lock for our shard
-  comp_event_cache& comp_cache=
-    comp_event_cache_list[coord->pos % COMP_EVENT_CACHE_NUM_SHARDS];
-  comp_event_queue& comp_queue=
-    comp_event_queue_list[coord->pos % COMP_EVENT_CACHE_NUM_SHARDS];
-  auto lock= &LOCK_comp_event_cache[coord->pos % COMP_EVENT_CACHE_NUM_SHARDS];
+  auto shard= coord->pos % COMP_EVENT_CACHE_NUM_SHARDS;
+  auto& comp_cache= comp_event_cache_list[shard];
+  auto& comp_queue= comp_event_queue_list[shard];
+  auto& comp_event_cache_size= comp_event_cache_size_list[shard];
+  auto lock= &LOCK_comp_event_cache[shard];
 
   // see if the event already exists in the cache
   if (auto elem= comp_cache.get(ev_key))
   {
     ++cache_hit_count;
     auto ret= *elem;
+    update_comp_event_cache_counters();
     return ret;
   }
 
@@ -666,15 +751,17 @@ static binlog_comp_event get_compressed_event(NET *net,
   if (elem == NULL)
   {
     comp_event= compress_event(net, packet);
-    if (!comp_event.buff) goto err;
+    if (unlikely(!comp_event.buff)) goto err;
 
     const ulonglong max_cache_size_bytes=
                               (1 << 20) * opt_max_compressed_event_cache_size;
+    const ulonglong max_cache_shard_size=
+      max_cache_size_bytes / COMP_EVENT_CACHE_NUM_SHARDS;
 
-    if (comp_event.len < max_cache_size_bytes)
+    if (likely(comp_event.len < max_cache_shard_size))
     {
       comp_event_cache_size+= comp_event.len;
-      evict_compressed_events(comp_cache, comp_queue, max_cache_size_bytes);
+      evict_compressed_events(shard, max_cache_shard_size);
       auto comp_event_ptr= new binlog_comp_event(comp_event.buff,
                                                  comp_event.len);
       mutator.assignValue(comp_event_ptr);
@@ -688,14 +775,7 @@ static binlog_comp_event get_compressed_event(NET *net,
     ++cache_hit_count;
   }
 
-  // case: one minute is up since the last stats update, re-calculate
-  if (difftime(my_time(0), cache_stats_timer) >= 60)
-  {
-    comp_event_cache_hit_ratio=
-      (double) cache_hit_count / (cache_hit_count + cache_miss_count);
-    cache_hit_count= cache_miss_count= 0;
-    cache_stats_timer= my_time(0);
-  }
+  update_comp_event_cache_counters();
 
 err:
   mysql_mutex_unlock(lock);
@@ -709,7 +789,7 @@ static binlog_comp_event get_compressed_event(NET *net,
                                               bool is_semi_sync_slave,
                                               bool cache)
 {
-  if (!cache)
+  if (unlikely(!cache))
     return compress_event(net, packet);
 
   ulong file_num= strtoul(strrchr(coord->file_name, '.') + 1, NULL, 10);
@@ -717,9 +797,9 @@ static binlog_comp_event get_compressed_event(NET *net,
   // case: file num can't fit in 20 bits or pos can't fit in 41 bits or comp lib
   // can't fit in 2 bits, so we cannot create a 64 bit integer key for this
   // event
-  if (file_num >= ((ulonglong) 1 << 21) ||
-      coord->pos >= ((ulonglong) 1 << 42) ||
-      net->comp_lib >= ((ulonglong) 1 << 3))
+  if (unlikely(file_num >= ((ulonglong) 1 << 21) ||
+               coord->pos >= ((ulonglong) 1 << 42) ||
+               net->comp_lib >= ((ulonglong) 1 << 3)))
   {
     sql_print_warning("Not caching binlog event %s:%llu because the cache key "
                       "is out of bounds", coord->file_name, coord->pos);
@@ -736,10 +816,10 @@ static binlog_comp_event get_compressed_event(NET *net,
   binlog_comp_event comp_event;
 
   // get cache, queue and corresponding lock for our shard
-  comp_event_cache& comp_cache=
-    comp_event_cache_list[coord->pos % COMP_EVENT_CACHE_NUM_SHARDS];
-  comp_event_queue& comp_queue=
-    comp_event_queue_list[coord->pos % COMP_EVENT_CACHE_NUM_SHARDS];
+  auto shard= coord->pos % COMP_EVENT_CACHE_NUM_SHARDS;
+  auto& comp_cache= comp_event_cache_list[shard];
+  auto& comp_queue= comp_event_queue_list[shard];
+  auto& comp_event_cache_size= comp_event_cache_size_list[shard];
   auto lock= &LOCK_comp_event_cache[coord->pos % COMP_EVENT_CACHE_NUM_SHARDS];
 
   // see if the event already exists in the cache
@@ -751,6 +831,7 @@ static binlog_comp_event get_compressed_event(NET *net,
     ++cache_hit_count;
     auto retval= *elem->second;
     mysql_rwlock_unlock(lock);
+    update_comp_event_cache_counters();
     return retval;
   }
   mysql_rwlock_unlock(lock);
@@ -768,15 +849,17 @@ static binlog_comp_event get_compressed_event(NET *net,
   if (inserted)
   {
     comp_event= compress_event(net, packet);
-    if (!comp_event.buff) goto err;
+    if (unlikely(!comp_event.buff)) goto err;
 
     const ulonglong max_cache_size_bytes=
                               (1 << 20) * opt_max_compressed_event_cache_size;
+    const ulonglong max_cache_shard_size=
+      max_cache_size_bytes / COMP_EVENT_CACHE_NUM_SHARDS;
 
-    if (comp_event.len < max_cache_size_bytes)
+    if (likely(comp_event.len < max_cache_shard_size))
     {
       comp_event_cache_size+= comp_event.len;
-      evict_compressed_events(comp_cache, comp_queue, max_cache_size_bytes);
+      evict_compressed_events(shard, max_cache_shard_size);
       // this inserts the event into the cache
       kv->second->buff= comp_event.buff;
       kv->second->len= comp_event.len;
@@ -790,14 +873,7 @@ static binlog_comp_event get_compressed_event(NET *net,
     ++cache_hit_count;
   }
 
-  // case: one minute is up since the last stats update, re-calculate
-  if (difftime(my_time(0), cache_stats_timer) >= 60)
-  {
-    comp_event_cache_hit_ratio=
-      (double) cache_hit_count / (cache_hit_count + cache_miss_count);
-    cache_hit_count= cache_miss_count= 0;
-    cache_stats_timer= my_time(0);
-  }
+  update_comp_event_cache_counters();
 
 err:
   mysql_rwlock_unlock(lock);
@@ -820,15 +896,22 @@ int my_net_write_event(NET *net,
   binlog_comp_event comp_event;
 
   // case: wait for ack from semi-sync acker before sending the event
-  if (wait_for_ack && !is_semi_sync_slave)
-    wait_for_semi_sync_ack(coord);
+  if (unlikely(wait_for_ack &&
+               !is_semi_sync_slave &&
+               !wait_for_semi_sync_ack(coord)))
+  {
+    if (errmsg) *errmsg = "Error while waiting for semi-sync ACK";
+    if (errnum) *errnum= ER_UNKNOWN_ERROR;
+    sql_print_error("Error while waiting for semi-sync ACK on dump thread");
+    return 1;
+  }
 
   DBUG_ASSERT(!(net->compress_event && net->compress));
   if (net->compress_event)
   {
     comp_event= get_compressed_event(net, coord, packet,
                                      is_semi_sync_slave, cache);
-    if (!comp_event.buff)
+    if (unlikely(!comp_event.buff))
     {
       if (errmsg) *errmsg = "Couldn't compress binlog event, out of memory";
       if (errnum) *errnum= ER_OUT_OF_RESOURCES;
@@ -838,7 +921,7 @@ int my_net_write_event(NET *net,
     buff_len= comp_event.len;
   }
 
-  if (my_net_write(net, buff, buff_len))
+  if (unlikely(my_net_write(net, buff, buff_len)))
   {
     if (errmsg) *errmsg = "Failed on my_net_write()";
     if (errnum) *errnum= ER_UNKNOWN_ERROR;
@@ -924,14 +1007,6 @@ static int fake_rotate_event(NET* net, String* packet, char* log_file_name,
     DBUG_RETURN(-1);
   }
   DBUG_RETURN(0);
-}
-
-static bool is_semi_sync_slave()
-{
-  int null_value;
-  long long val= 0;
-  get_user_var_int("rpl_semi_sync_slave", &val, &null_value);
-  return val;
 }
 
 /*
@@ -1093,6 +1168,16 @@ static ulonglong get_heartbeat_period(THD * thd)
   my_bool null_value;
   LEX_STRING name=  { C_STRING_WITH_LEN("master_heartbeat_period")};
   user_var_entry *entry= 
+    (user_var_entry*) my_hash_search(&thd->user_vars, (uchar*) name.str,
+                                  name.length);
+  return entry? entry->val_int(&null_value) : 0;
+}
+
+static ulonglong get_dump_thread_wait_sleep(THD * thd)
+{
+  my_bool null_value;
+  LEX_STRING name=  { C_STRING_WITH_LEN("dump_thread_wait_sleep_usec")};
+  user_var_entry *entry=
     (user_var_entry*) my_hash_search(&thd->user_vars, (uchar*) name.str,
                                   name.length);
   return entry? entry->val_int(&null_value) : 0;
@@ -1797,6 +1882,8 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
     set_timespec_nsec(*heartbeat_ts, 0);
   }
 
+  ulonglong dump_thread_wait_sleep_usec= get_dump_thread_wait_sleep(thd);
+
 #ifndef DBUG_OFF
   if (opt_sporadic_binlog_dump_fail && (binlog_dump_count++ % 2))
   {
@@ -1960,7 +2047,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
   if (log_warnings > 1)
     sql_print_information("Start binlog_dump to master_thread_id(%u) slave_server(%u), pos(%s, %lu)",
                           thd->thread_id(), thd->server_id, log_ident, (ulong)pos);
-  semi_sync_slave = is_semi_sync_slave();
+  semi_sync_slave = is_semi_sync_slave(thd);
   if (semi_sync_slave &&
       RUN_HOOK(binlog_transmit, transmit_start,
                (thd, flags, log_ident, pos, &observe_transmission)))
@@ -1969,6 +2056,15 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
     my_errno= ER_UNKNOWN_ERROR;
     GOTO_ERR;
   }
+
+  // case: let's assume semi-sync acks have been received for binlog pos being
+  // requested by the acker
+  if (semi_sync_slave && !skip_group && rpl_wait_for_semi_sync_ack)
+  {
+    const LOG_POS_COORD start_coord= { p_coord->file_name, p_start_coord->pos };
+    signal_semi_sync_ack(&start_coord);
+  }
+
   has_transmit_started= true;
   /* reset transmit packet for the fake rotate event below */
   if (reset_transmit_packet(thd, flags, &ev_offset, &errmsg,
@@ -2421,6 +2517,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
                                semi_sync_slave,
                                event_type != FORMAT_DESCRIPTION_EVENT &&
                                event_type != ROTATE_EVENT,
+                               rpl_semi_sync_master_enabled &&
                                rpl_wait_for_semi_sync_ack))
         {
           GOTO_ERR;
@@ -2588,6 +2685,23 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
             wait until we get a signal from other threads that binlog is
             updated.
           */
+
+          // case: sleep before locking and waiting for new data
+          if (unlikely(dump_thread_wait_sleep_usec != 0))
+          {
+            DBUG_EXECUTE_IF("reached_dump_thread_wait_sleep",
+                          {
+                            const char act[]= "now "
+                                              "signal reached "
+                                              "wait_for continue";
+                            DBUG_ASSERT(opt_debug_sync_timeout > 0);
+                            DBUG_ASSERT(
+                                !debug_sync_set_action(current_thd,
+                                                       STRING_WITH_LEN(act)));
+                          };);
+            usleep(dump_thread_wait_sleep_usec);
+          }
+
           mysql_bin_log.lock_binlog_end_pos();
 
           /*
@@ -3073,6 +3187,9 @@ err:
   @param[out]   value String to return UUID value.
 
   @return       if success value is returned else NULL is returned.
+
+  NOTE: Please make sure this method is in sync with
+        ReplSemiSyncMaster::get_slave_uuid
 */
 String *get_slave_uuid(THD *thd, String *value)
 {
@@ -3240,19 +3357,15 @@ int reset_master(THD* thd)
 
   @param thd                  Pointer to THD object for the client thread executing
                               the statement.
-  @param file                 Name of the current bin log.
-  @param pos                  Position int he current bin log.
-  @param gtid_executed        Logged gtids in binlogs.
-  @param gtid_executed_length Length of gtid_executed string.
+  @param ss_info              Snapshot context that contains binlog file/pos,
+                              executed gtids and snapshot id
   @param need_ok              [out] Whether caller needs to call my_ok vs it
                               having been done in this function via my_eof.
 
   @retval FALSE success
   @retval TRUE failure
 */
-bool show_master_offset(THD* thd, const char* file, ulonglong pos,
-                        const char* gtid_executed, int gtid_executed_length,
-                        bool *need_ok)
+bool show_master_offset(THD* thd, snapshot_info_st &ss_info, bool *need_ok)
 {
   Protocol *protocol= thd->protocol;
   DBUG_ENTER("show_master_offset");
@@ -3261,7 +3374,12 @@ bool show_master_offset(THD* thd, const char* file, ulonglong pos,
   field_list.push_back(new Item_return_int("Position",20,
                                            MYSQL_TYPE_LONGLONG));
   field_list.push_back(new Item_empty_string("Gtid_executed",
-                                             gtid_executed_length));
+                                             ss_info.gtid_executed.length()));
+  if (ss_info.snapshot_id)
+  {
+    field_list.push_back(new Item_return_int("Snapshot_ID",20,
+                                            MYSQL_TYPE_LONGLONG));
+  }
 
   if (protocol->send_result_set_metadata(&field_list,
                                          Protocol::SEND_NUM_ROWS |
@@ -3270,12 +3388,17 @@ bool show_master_offset(THD* thd, const char* file, ulonglong pos,
 
   protocol->prepare_for_resend();
 
-  int dir_len = dirname_length(file);
-  protocol->store(file + dir_len, &my_charset_bin);
+  int dir_len = dirname_length(ss_info.binlog_file.c_str());
+  protocol->store(ss_info.binlog_file.c_str() + dir_len, &my_charset_bin);
 
-  protocol->store(pos);
+  protocol->store(ss_info.binlog_pos);
 
-  protocol->store(gtid_executed, &my_charset_bin);
+  protocol->store(ss_info.gtid_executed.c_str(), &my_charset_bin);
+
+  if (ss_info.snapshot_id)
+  {
+    protocol->store(ss_info.snapshot_id);
+  }
 
   if (protocol->write())
     DBUG_RETURN(TRUE);

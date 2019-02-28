@@ -165,7 +165,7 @@ public:
   bool store(THD *thd, String &buf) override;
   void mark_as_changed(THD *thd, LEX_CSTRING *tracked_item_name,
                        LEX_CSTRING *tracked_item_value = NULL) override;
-  bool force_enable() { return true; }
+  bool force_enable() override { return true; }
 };
 
 
@@ -352,6 +352,13 @@ bool Session_resp_attr_tracker::store(THD *thd, String &buf)
   return false;
 }
 
+void Session_resp_attr_tracker::audit_tracker(
+    std::map<std::string, std::string>& audit_map) {
+  for (const auto& kp : attrs_) {
+    audit_map[kp.first] = kp.second;
+  }
+}
+
 /**
   @brief Mark the tracker as changed and store the response attributes
 
@@ -368,8 +375,24 @@ void Session_resp_attr_tracker::mark_as_changed(THD *thd,
   DBUG_ASSERT(key->length > 0);
   std::string k(key->str, key->length);
 
-  attrs_[k] = std::move(std::string(value->str, value->length));
+  attrs_[k] = std::string(value->str, value->length);
   m_changed= true;
+}
+
+/**
+  @brief Enable/disable the tracker based on
+         @@session_track_response_attributes's value.
+
+  @param thd [IN]           The thd handle.
+
+  @return
+    false (always)
+*/
+bool Session_resp_attr_tracker::enable(THD *thd)
+{
+  m_enabled= m_forced_enabled ||
+      thd->variables.session_track_response_attributes != OFF;
+  return false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -484,8 +507,10 @@ void Session_tracker::store(THD *thd, String &buf)
   /* Get total length. */
   for (int i= 0; i <= SESSION_TRACKER_END; i ++)
   {
-    if (m_trackers[i]->is_changed(thd))
+    if (m_trackers[i]->is_changed(thd)) {
+      m_trackers[i]->audit_tracker(audit_attrs);
       m_trackers[i]->store(thd, temp);
+    }
   }
 
   length= temp.length();

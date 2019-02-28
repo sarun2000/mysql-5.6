@@ -27,12 +27,14 @@ CREATE TABLE t2 (i int, s char (10));
 # Send a wrong formatted rpc_id
 
 SELECT 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: The specified detached session id (123wrong_format) is an unexpected format
+SELECT 1;
+ERROR HY000: The specified detached session id (4000000000) is unknown
 
 # Case 3: Send queries that change state and create client session
 
 SET @my_var='new_value';
-SET SESSION wait_timeout=10;
+SET SESSION wait_timeout=100;
 SELECT 1;
 1
 1
@@ -74,18 +76,19 @@ SELECT 1;
 1
 1
 UNLOCK TABLES;
+KILL rpc_id6;
 
 # Case 5: Attempt to use same session from multiple threads
 
 select sleep(5);
 select 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: Session already in use by another query
 select 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: Session already in use by another query
 select 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: Session already in use by another query
 select 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: Session already in use by another query
 sleep(5)
 0
 
@@ -118,10 +121,12 @@ Id	User	Host	db	Command	Time	State	Info	Rows examined	Rows sent	Tid	Conn_Id
 1	root	localhost	db_default	Sleep	0	Detached	NULL	0	1	#	0
 1	root	localhost	db_default	Sleep	0	Detached	NULL	0	0	#	0
 1	root	localhost	db_default	Sleep	0	Detached	NULL	0	0	#	0
-1	root	localhost	db_default	Sleep	0	Detached	NULL	1	1	#	0
+1	root	localhost	db_default	Sleep	0	Detached	NULL	0	1	#	0
 1	root	localhost	db_default	Sleep	0	Detached	NULL	0	0	#	0
+1	root	localhost	db_default	Sleep	0	Detached	NULL	1	1	#	0
 select * from information_schema.srv_sessions;
 ID	USER	HOST	DB	COMMAND	TIME	STATE	INFO	CONN_ID
+1	root	localhost	db_default	Sleep	0	Detached	NULL	0
 1	root	localhost	db_default	Sleep	0	Detached	NULL	0
 1	root	localhost	db_default	Sleep	0	Detached	NULL	0
 1	root	localhost	db_default	Sleep	0	Detached	NULL	0
@@ -143,9 +148,9 @@ ID	USER	HOST	DB	COMMAND	TIME	STATE	INFO	CONN_ID
 select 1;
 1
 1
-# Trying to use the rpc_id7 will get an error
+# Trying to use the rpc_id will get an error
 select 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: The specified detached session id (<rpc_id>) is unknown
 
 # Kill Query in Attached Session
 SELECT GET_LOCK("my_lock", 0);
@@ -155,10 +160,10 @@ SET @my_var='new_value';
 SELECT GET_LOCK('my_lock', 3600);
 select * from information_schema.srv_sessions where id=rpc_id;
 ID	USER	HOST	DB	COMMAND	TIME	STATE	INFO	CONN_ID
-rpc_id	root	localhost	db_default	Query	0	User lock	SELECT GET_LOCK('my_lock', 3600)	1
+rpc_id	root	localhost	db_default	Query attributes	0	User lock	SELECT GET_LOCK('my_lock', TIMEOUT)	1
 select * from information_schema.processlist where SRV_ID=rpc_id;
 ID	USER	HOST	DB	COMMAND	TIME	STATE	INFO	SRV_ID
-1	root	localhost	db_default	Query	0	User lock	SELECT GET_LOCK('my_lock', 3600)	rpc_id
+1	root	localhost	db_default	Query attributes	0	User lock	SELECT GET_LOCK('my_lock', TIMEOUT)	rpc_id
 KILL QUERY rpc_id;
 select * from information_schema.srv_sessions where id=rpc_id;
 ID	USER	HOST	DB	COMMAND	TIME	STATE	INFO	CONN_ID
@@ -198,6 +203,7 @@ KILL rpc_id;
 KILL rpc_id;
 KILL rpc_id;
 KILL rpc_id;
+KILL lock_rpc_id;
 select count(id) from information_schema.srv_sessions;
 count(id)
 0
@@ -209,7 +215,7 @@ count(id)
 
 create user proxyuser;
 SELECT 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: User proxyuser does not have PROXY privilege for user scriptro
 grant proxy on scriptro to proxyuser;
 SELECT 1;
 1
@@ -222,7 +228,7 @@ database()
 db_rpc
 revoke proxy on scriptro from proxyuser;
 SELECT 1;
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: User proxyuser does not have PROXY privilege for user scriptro
 create user scriptrw;
 grant proxy on '%' to proxyuser;
 SELECT user();
@@ -233,7 +239,230 @@ user()
 scriptrw@localhost
 revoke proxy on '%' from proxyuser;
 SELECT user();
-ERROR HY000: Lost connection to MySQL server during query
+ERROR HY000: User proxyuser does not have PROXY privilege for user scriptrw
+
+# Case 10: Make sure a detached session times out when idle
+
+SET @my_var='new_value';
+SET SESSION wait_timeout=5;
+SELECT 1;
+1
+1
+SELECT sleep(2);
+sleep(2)
+0
+SELECT 1;
+1
+1
+SELECT sleep(6);
+sleep(6)
+0
+SELECT 1;
+ERROR HY000: The specified detached session id (<rpc_id>) has been removed because it was idle 5000ms
+SELECT 1;
+ERROR HY000: The specified detached session id (<rpc_id>) has been removed because it was idle 5000ms
+SELECT sleep(11);
+sleep(11)
+0
+SELECT 1;
+ERROR HY000: The specified detached session id (<rpc_id>) is unknown
+
+# Case 11: Make sure a detached session that times out cleans up
+
+SELECT GET_LOCK("my_lock_case_11", 0);
+GET_LOCK("my_lock_case_11", 0)
+1
+SET SESSION wait_timeout=5;
+SELECT GET_LOCK("my_lock_case_11", 0);
+GET_LOCK("my_lock_case_11", 0)
+0
+SELECT sleep(6);
+sleep(6)
+0
+SELECT GET_LOCK("my_lock_case_11", 0);
+GET_LOCK("my_lock_case_11", 0)
+1
+
+# Case 12: Test idle timeout for multiple detached sessions
+
+SELECT GET_LOCK("my_lock1", 0);
+GET_LOCK("my_lock1", 0)
+1
+SELECT GET_LOCK("my_lock2", 0);
+GET_LOCK("my_lock2", 0)
+1
+SELECT GET_LOCK("my_lock3", 0);
+GET_LOCK("my_lock3", 0)
+1
+SET SESSION wait_timeout=3;
+SET SESSION wait_timeout=6;
+SET SESSION wait_timeout=9;
+SELECT sleep(1);
+sleep(1)
+0
+SHOW srv_sessions;
+Id	User	Host	db	Command	Time	State	Info	Rows examined	Rows sent	Tid	Conn_Id
+#	scriptro	localhost	db_rpc	Sleep	#	Detached	NULL	0	0	#	0
+#	scriptro	localhost	db_rpc	Sleep	#	Detached	NULL	0	0	#	0
+#	scriptro	localhost	db_rpc	Sleep	#	Detached	NULL	0	0	#	0
+SELECT sleep(3);
+sleep(3)
+0
+SHOW srv_sessions;
+Id	User	Host	db	Command	Time	State	Info	Rows examined	Rows sent	Tid	Conn_Id
+#	scriptro	localhost	db_rpc	Sleep	#	Detached	NULL	0	0	#	0
+#	scriptro	localhost	db_rpc	Sleep	#	Detached	NULL	0	0	#	0
+SELECT sleep(3);
+sleep(3)
+0
+SHOW srv_sessions;
+Id	User	Host	db	Command	Time	State	Info	Rows examined	Rows sent	Tid	Conn_Id
+#	scriptro	localhost	db_rpc	Sleep	#	Detached	NULL	0	0	#	0
+SELECT sleep(3);
+sleep(3)
+0
+SHOW srv_sessions;
+Id	User	Host	db	Command	Time	State	Info	Rows examined	Rows sent	Tid	Conn_Id
+SELECT GET_LOCK("my_lock1", 0);
+GET_LOCK("my_lock1", 0)
+1
+SELECT RELEASE_LOCK("my_lock1");
+RELEASE_LOCK("my_lock1")
+1
+SELECT GET_LOCK("my_lock2", 0);
+GET_LOCK("my_lock2", 0)
+1
+SELECT RELEASE_LOCK("my_lock2");
+RELEASE_LOCK("my_lock2")
+1
+SELECT GET_LOCK("my_lock3", 0);
+GET_LOCK("my_lock3", 0)
+1
+SELECT RELEASE_LOCK("my_lock3");
+RELEASE_LOCK("my_lock3")
+1
+
+# Case 13: Make sure large responses are returned correctly
+
+SET SESSION wait_timeout=5;
+SELECT USER();
+USER()
+root@localhost
+SELECT USER(), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000), REPEAT('X', 4000000),
+REPEAT('X', 4000000), REPEAT('X', 4000000);
+USER()	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)	REPEAT('X', 4000000)
+scriptro@localhost	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>	<4Mb of 'X's>
+
+# Case 14: Make sure character set is being handled
+
+
+the character set (client/connection/results) for con1 should be cp1251
+
+SHOW VARIABLES LIKE 'character\_set\_%';
+Variable_name	Value
+character_set_client	cp1251
+character_set_connection	cp1251
+character_set_database	latin1
+character_set_filesystem	binary
+character_set_results	cp1251
+character_set_server	latin1
+character_set_system	utf8
+SET @my_var='new_value';
+
+the character set for a detached session should be cp1251
+
+SHOW VARIABLES LIKE 'character\_set\_%';
+Variable_name	Value
+character_set_client	cp1251
+character_set_connection	cp1251
+character_set_database	latin1
+character_set_filesystem	binary
+character_set_results	cp1251
+character_set_server	latin1
+character_set_system	utf8
+
+The charset for this new connection should be switched back to latin1
+
+SHOW VARIABLES LIKE 'character\_set\_%';
+Variable_name	Value
+character_set_client	latin1
+character_set_connection	latin1
+character_set_database	latin1
+character_set_filesystem	binary
+character_set_results	latin1
+character_set_server	latin1
+character_set_system	utf8
+
+reusing the rpc_id created above should still have the old charset info
+
+SHOW VARIABLES LIKE 'character\_set\_%';
+Variable_name	Value
+character_set_client	cp1251
+character_set_connection	cp1251
+character_set_database	latin1
+character_set_filesystem	binary
+character_set_results	cp1251
+character_set_server	latin1
+character_set_system	utf8
+set @my_var='new_value';
+
+A newly created rpc_id with latin1 charset should show latin1
+
+SHOW VARIABLES LIKE 'character\_set\_%';
+Variable_name	Value
+character_set_client	latin1
+character_set_connection	latin1
+character_set_database	latin1
+character_set_filesystem	binary
+character_set_results	latin1
+character_set_server	latin1
+character_set_system	utf8
+
+Make sure changing the charset midflight on a detached session works
+
+SET NAMES 'cp1251';
+SHOW VARIABLES LIKE 'character\_set\_%';
+Variable_name	Value
+character_set_client	cp1251
+character_set_connection	cp1251
+character_set_database	latin1
+character_set_filesystem	binary
+character_set_results	cp1251
+character_set_server	latin1
+character_set_system	utf8
+KILL rpc_id;
+KILL rpc_id;
+
+# Case 15: Test Multiquery
+
+set @my_var='value_1';
+SET @my_var='new_value';SELECT @my_var|
+@my_var
+new_value
+SELECT @my_var; SET @my_var='other_value'; SELECT @my_var|
+@my_var
+new_value
+@my_var
+other_value
+
+# Case 16: Per-user-session-variables
+
+SET @original_val = @@global.per_user_session_var_default_val;
+SET @@global.per_user_session_var_default_val = "scriptro:lock_wait_timeout=23";
+SELECT @@global.lock_wait_timeout, @@session.lock_wait_timeout;
+@@global.lock_wait_timeout	@@session.lock_wait_timeout
+604800.000000	23.000000
+SET @@global.per_user_session_var_default_val = @original_val;
+SELECT @@global.per_user_session_var_default_val;
+@@global.per_user_session_var_default_val
+NULL
 drop database db_default;
 drop database db_rpc;
 drop user scriptro;

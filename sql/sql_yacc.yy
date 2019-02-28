@@ -1244,7 +1244,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
    MYSQL-FUNC : MySQL extention, function
    INTERNAL   : Not a real token, lex optimization
    OPERATOR   : SQL operator
-   FUTURE-USE : Reserved for futur use
+   FUTURE-USE : Reserved for future use
 
    This makes the code grep-able, and helps maintenance.
 */
@@ -1254,6 +1254,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  ACTION                        /* SQL-2003-N */
 %token  ADD                           /* SQL-2003-R */
 %token  ADDDATE_SYM                   /* MYSQL-FUNC */
+%token  ADMIN_SYM
 %token  AFTER_SYM                     /* SQL-2003-N */
 %token  AGAINST
 %token  AGGREGATE_SYM
@@ -1271,6 +1272,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  ASENSITIVE_SYM                /* FUTURE-USE */
 %token  ASYNC_COMMIT_SYM
 %token  AT_SYM                        /* SQL-2003-R */
+%token  ATTACH_SYM
 %token  AUTOEXTEND_SIZE_SYM
 %token  AUTO_INC
 %token  AVG_ROW_LENGTH
@@ -1424,10 +1426,12 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  EXAMINED_SYM
 %token  EXCHANGE_SYM
 %token  EXECUTE_SYM                   /* SQL-2003-R */
+%token  EXISTING_SYM
 %token  EXISTS                        /* SQL-2003-R */
 %token  EXIT_SYM
 %token  EXPANSION_SYM
 %token  EXPIRE_SYM
+%token  EXPLICIT_SYM
 %token  EXPORT_SYM
 %token  EXTENDED_SYM
 %token  EXTENT_SIZE_SYM
@@ -1754,6 +1758,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  SET                           /* SQL-2003-R */
 %token  SET_VAR
 %token  SHARE_SYM
+%token  SHARED_SYM
 %token  SHIFT_LEFT                    /* OPERATOR */
 %token  SHIFT_RIGHT                   /* OPERATOR */
 %token  SHOW
@@ -2141,7 +2146,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         part_column_list
         server_def server_options_list server_option
         definer_opt no_definer definer get_diagnostics
-        alter_user_list find
+        alter_user_list find attach
 END_OF_INPUT
 
 %type <NONE> call sp_proc_stmts sp_proc_stmts1 sp_proc_stmt
@@ -2274,6 +2279,7 @@ verb_clause:
 statement:
           alter
         | analyze
+        | attach
         | binlog_base64_event
         | call
         | change
@@ -2755,6 +2761,7 @@ create:
             Lex->create_info.used_fields= 0;
             Lex->create_info.db_read_only=
               enum_db_read_only::DB_READ_ONLY_NULL;
+            Lex->create_info.alter_db_metadata= false;
           }
           opt_create_database_options
           {
@@ -2786,6 +2793,11 @@ create:
         | CREATE server_def
           {
             Lex->sql_command= SQLCOM_CREATE_SERVER;
+          }
+        | CREATE EXPLICIT_SYM known_storage_engines SNAPSHOT_SYM
+          {
+            Lex->sql_command=SQLCOM_CREATE_EXPLICIT_SNAPSHOT;
+            Lex->create_info.db_type = $3;
           }
         ;
 
@@ -6579,6 +6591,7 @@ db_metadata_str:
             }
             Lex->create_info.db_metadata= String($3.str, $3.length,
               &my_charset_bin);
+            Lex->create_info.alter_db_metadata= true;
           }
         ;
 
@@ -7791,6 +7804,7 @@ alter:
             Lex->create_info.used_fields= 0;
             Lex->create_info.db_read_only=
               enum_db_read_only::DB_READ_ONLY_NULL;
+            Lex->create_info.alter_db_metadata= false;
           }
           create_database_options
           {
@@ -8649,6 +8663,17 @@ start_transaction_option:
           {
             $$= MYSQL_START_TRANS_OPT_WITH_CONS_ENGINE_SNAPSHOT;
             Lex->create_info.db_type = $3;
+          }
+        | WITH SHARED_SYM known_storage_engines SNAPSHOT_SYM
+          {
+            $$= MYSQL_START_TRANS_OPT_WITH_SHAR_ENGINE_SNAPSHOT;
+            Lex->create_info.db_type = $3;
+          }
+        | WITH EXISTING_SYM known_storage_engines SNAPSHOT_SYM ulonglong_num
+          {
+            $$= MYSQL_START_TRANS_OPT_WITH_EXIS_ENGINE_SNAPSHOT;
+            Lex->create_info.db_type = $3;
+            Lex->snapshot_id = $5;
           }
         | READ_SYM ONLY_SYM
           {
@@ -13975,6 +14000,16 @@ use:
           }
         ;
 
+attach:
+          ATTACH_SYM EXPLICIT_SYM known_storage_engines SNAPSHOT_SYM
+          ulonglong_num
+          {
+            Lex->sql_command=SQLCOM_ATTACH_EXPLICIT_SNAPSHOT;
+            Lex->create_info.db_type = $3;
+            Lex->snapshot_id = $5;
+          }
+        ;
+
 /* import, export of files */
 
 load:
@@ -14950,6 +14985,7 @@ user:
 keyword:
           keyword_sp            {}
         | ASCII_SYM             {}
+        | ATTACH_SYM            {}
         | BACKUP_SYM            {}
         | BEGIN_SYM             {}
         | BYTE_SYM              {}
@@ -15011,6 +15047,7 @@ keyword:
 keyword_sp:
           ACTION                   {}
         | ADDDATE_SYM              {}
+        | ADMIN_SYM                {}
         | AFTER_SYM                {}
         | AGAINST                  {}
         | AGGREGATE_SYM            {}
@@ -15091,8 +15128,10 @@ keyword_sp:
         | EVENTS_SYM               {}
         | EVERY_SYM                {}
         | EXCHANGE_SYM             {}
+        | EXISTING_SYM             {}
         | EXPANSION_SYM            {}
         | EXPIRE_SYM               {}
+        | EXPLICIT_SYM             {}
         | EXPORT_SYM               {}
         | EXTENDED_SYM             {}
         | EXTENT_SIZE_SYM          {}
@@ -15263,6 +15302,7 @@ keyword_sp:
         | SESSION_SYM              {}
         | SIMPLE_SYM               {}
         | SHARE_SYM                {}
+        | SHARED_SYM               {}
         | SHUTDOWN                 {}
         | SKIP_SYM                 {}
         | SLOW                     {}
@@ -16324,6 +16364,7 @@ object_privilege:
         | EVENT_SYM               { Lex->grant |= EVENT_ACL;}
         | TRIGGER_SYM             { Lex->grant |= TRIGGER_ACL; }
         | CREATE TABLESPACE       { Lex->grant |= CREATE_TABLESPACE_ACL; }
+        | ADMIN_SYM PORT_SYM      { Lex->grant |= ADMIN_PORT_ACL; }
         ;
 
 opt_and:
@@ -16706,6 +16747,11 @@ release:
             LEX *lex=Lex;
             lex->sql_command= SQLCOM_RELEASE_SAVEPOINT;
             lex->ident= $3;
+          }
+        | RELEASE_SYM EXPLICIT_SYM known_storage_engines SNAPSHOT_SYM
+          {
+            Lex->sql_command=SQLCOM_RELEASE_EXPLICIT_SNAPSHOT;
+            Lex->create_info.db_type = $3;
           }
         ;
 

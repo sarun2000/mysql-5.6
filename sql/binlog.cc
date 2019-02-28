@@ -95,6 +95,13 @@ static int binlog_commit(handlerton *hton, THD *thd, bool all, bool async);
 static int binlog_rollback(handlerton *hton, THD *thd, bool all);
 static int binlog_prepare(handlerton *hton, THD *thd, bool all, bool async);
 
+Slow_log_throttle log_throttle_sbr_unsafe_query(
+  &opt_log_throttle_sbr_unsafe_queries,
+  &LOCK_log_throttle_sbr_unsafe,
+  Log_throttle::LOG_THROTTLE_WINDOW_SIZE,
+  slow_log_print,
+  "throttle: %10lu 'sbr unsafe' warning(s) suppressed.");
+
 #ifdef HAVE_REPLICATION
 static inline bool has_commit_order_manager(THD *thd)
 {
@@ -336,9 +343,6 @@ public:
     cache_log.end_of_file= saved_max_binlog_cache_size;
   }
 
-  int write_trx_metadata(THD *thd);
-  void add_time_metadata(THD *thd, ptree &meta_data_root);
-  void add_db_metadata(THD *thd, ptree &meta_data_root);
   int finalize(THD *thd, Log_event *end_event);
   int flush(THD *thd, my_off_t *bytes, bool *wrote_xid, bool async);
   int write_event(THD *thd, Log_event *event,
@@ -390,6 +394,36 @@ public:
     return flags.incident;
   }
 
+  /**
+    Sets the binlog_cache_data::Flags::flush_error flag if there
+    is an error while flushing cache to the file.
+
+    @param thd  The client thread that is executing the transaction.
+  */
+  void set_flush_error(THD *thd)
+  {
+    flags.flush_error= true;
+    if(is_trx_cache())
+    {
+      /*
+         If the cache is a transactional cache and if the write
+         has failed due to ENOSPC, then my_write() would have
+         set EE_WRITE error, so clear the error and create an
+         equivalent server error.
+      */
+      if (thd->is_error())
+        thd->clear_error();
+      char errbuf[MYSYS_STRERROR_SIZE];
+      my_error(ER_ERROR_ON_WRITE, MYF(MY_WME), my_filename(cache_log.file),
+          errno, my_strerror(errbuf, sizeof(errbuf), errno));
+    }
+  }
+
+  bool get_flush_error(void) const
+  {
+    return flags.flush_error;
+  }
+
   bool has_xid() const {
     // There should only be an XID event if we are transactional
     DBUG_ASSERT((flags.transactional && flags.with_xid) || !flags.with_xid);
@@ -434,6 +468,7 @@ public:
     flags.with_xid= false;
     flags.immediate= false;
     flags.finalized= false;
+    flags.flush_error= false;
     /*
       The truncate function calls reinit_io_cache that calls my_b_flush_io_cache
       which may increase disk_writes. This breaks the disk_writes use by the
@@ -505,7 +540,13 @@ protected:
   {
     DBUG_PRINT("info", ("truncating to position %lu", (ulong) pos));
     remove_pending_event();
-    reinit_io_cache(&cache_log, WRITE_CACHE, pos, 0, 0);
+    /*
+      Whenever there is an error while flushing cache to file,
+      the local cache will not be in a normal state and the same
+      cache cannot be used without facing an assert.
+      So, clear the cache if there is a flush error.
+    */
+    reinit_io_cache(&cache_log, WRITE_CACHE, pos, 0, get_flush_error());
     cache_log.end_of_file= saved_max_binlog_cache_size;
   }
 
@@ -551,6 +592,12 @@ protected:
       This indicates that the cache contain an XID event.
      */
     bool with_xid:1;
+
+    /*
+      This flag is set to 'true' when there is an error while flushing the
+      I/O cache to file.
+     */
+    bool flush_error:1;
   } flags;
 
 private:
@@ -1007,13 +1054,40 @@ int binlog_cache_data::write_event(THD *thd,
   {
     // case: write meta data event before the real event
     // see @opt_binlog_trx_meta_data
-    if (write_meta_data_event && write_trx_metadata(thd))
-      DBUG_RETURN(1);
+    if (write_meta_data_event)
+    {
+      std::string metadata= thd->gen_trx_metadata();
+      Rows_query_log_event metadata_ev(thd, metadata.c_str(),
+          metadata.length());
+      if (metadata_ev.write(&cache_log) != 0)
+        DBUG_RETURN(1);
+    }
 
     DBUG_EXECUTE_IF("simulate_disk_full_at_binlog_cache_write",
                     { DBUG_SET("+d,simulate_no_free_space_error"); });
+
+    DBUG_EXECUTE_IF("simulate_tmpdir_partition_full",
+                  {
+                  static int count= -1;
+                  count++;
+                  if(count % 4 == 3 && ev->get_type_code() == WRITE_ROWS_EVENT)
+                    DBUG_SET("+d,simulate_temp_file_write_error");
+                  });
+
     if (ev->write(&cache_log) != 0)
     {
+      DBUG_EXECUTE_IF("simulate_temp_file_write_error",
+                      {
+                        DBUG_SET("-d,simulate_temp_file_write_error");
+                      });
+      /*
+        If the flush has failed due to ENOSPC error, set the
+        flush_error flag.
+      */
+      if (thd->is_error() && my_errno == ENOSPC)
+      {
+        set_flush_error(thd);
+      }
       DBUG_RETURN(1);
     }
     DBUG_EXECUTE_IF("simulate_disk_full_at_binlog_cache_write",
@@ -1156,12 +1230,41 @@ gtid_before_write_cache(THD* thd, binlog_cache_data* cache_data)
     Gtid_log_event gtid_ev(thd, cache_data->is_trx_cache(),
                            &cached_group->spec);
     bool using_file= cache_data->cache_log.pos_in_file > 0;
+
+    DBUG_EXECUTE_IF("simulate_tmpdir_partition_full",
+                  {
+                  DBUG_SET("+d,simulate_temp_file_write_error");
+                  });
+
     my_off_t saved_position= cache_data->reset_write_pos(0, using_file);
-    error= gtid_ev.write(&cache_data->cache_log);
-    cache_data->reset_write_pos(saved_position, using_file);
+
+    if (!cache_data->cache_log.error)
+    {
+      if (gtid_ev.write(&cache_data->cache_log))
+        goto err;
+      cache_data->reset_write_pos(saved_position, using_file);
+    }
+
+    if (cache_data->cache_log.error)
+      goto err;
   }
 
   DBUG_RETURN(error);
+
+err:
+  DBUG_EXECUTE_IF("simulate_tmpdir_partition_full",
+                {
+                DBUG_SET("-d,simulate_temp_file_write_error");
+                });
+  /*
+    If the reinit_io_cache has failed, set the flush_error flag.
+  */
+  if (cache_data->cache_log.error)
+  {
+    cache_data->set_flush_error(thd);
+  }
+  DBUG_RETURN(1);
+
 }
 
 /**
@@ -1203,131 +1306,6 @@ int gtid_empty_group_log_and_cleanup(THD *thd)
 
 err:
   DBUG_RETURN(ret);
-}
-
-/**
-  This function writes meta data in JSON format as a comment in a rows query
-  event.
-
-  @see binlog_trx_meta_data
-
-  @param thd The thread whose transaction should be flushed
-  @return nonzero if an error pops up when writing to the cache.
-*/
-int
-binlog_cache_data::write_trx_metadata(THD *thd)
-{
-  DBUG_ENTER("binlog_cache_data::write_trx_metadata");
-  DBUG_ASSERT(opt_binlog_trx_meta_data);
-
-  ptree pt;
-  std::ostringstream buf;
-
-  // case: read existing meta data received from the master
-  if (thd->rli_slave && !thd->rli_slave->trx_meta_data_json.empty())
-  {
-    std::istringstream is(thd->rli_slave->trx_meta_data_json);
-    try {
-      read_json(is, pt);
-    } catch (std::exception& e) {
-      // NO_LINT_DEBUG
-      sql_print_error("Exception while reading meta data: %s, JSON: %s",
-                       e.what(), thd->rli_slave->trx_meta_data_json.c_str());
-      DBUG_RETURN(1);
-    }
-    // clear existing data
-    thd->rli_slave->trx_meta_data_json.clear();
-  }
-
-  // add things to the meta data
-  try {
-    add_time_metadata(thd, pt);
-    add_db_metadata(thd, pt);
-  } catch (std::exception& e) {
-      // NO_LINT_DEBUG
-      sql_print_error("Exception while adding meta data: %s", e.what());
-      DBUG_RETURN(1);
-  }
-
-  // write meta data with new stuff in the binlog
-  try {
-    write_json(buf, pt, false);
-  } catch (std::exception& e) {
-      // NO_LINT_DEBUG
-      sql_print_error("Exception while writing meta data: %s", e.what());
-      DBUG_RETURN(1);
-  }
-  std::string json = buf.str();
-  boost::trim(json);
-
-  std::string comment_str= std::string("/*")
-                           .append(TRX_META_DATA_HEADER)
-                           .append(json)
-                           .append("*/");
-
-  Rows_query_log_event e(thd, comment_str.c_str(), comment_str.length());
-  DBUG_RETURN(write_event(thd, &e));
-}
-
-/**
-  This function adds timing information in meta data JSON of rows query event.
-
-  @see binlog_cache_data::write_trx_metadata
-
-  @param thd            The thread whose transaction should be flushed
-  @param meta_data_root Property tree object which represents the JSON
-*/
-void
-binlog_cache_data::add_time_metadata(THD *thd, ptree &meta_data_root)
-{
-  DBUG_ENTER("binlog_cache_data::add_time_metadata");
-  DBUG_ASSERT(opt_binlog_trx_meta_data);
-
-  // get existing timestamps
-  ptree timestamps= meta_data_root.get_child("timestamps", ptree());
-
-  // add our timestamp to the array
-  ptree timestamp;
-  ulonglong millis=
-    std::chrono::duration_cast<std::chrono::milliseconds>
-      (std::chrono::system_clock::now().time_since_epoch()).count();
-  timestamp.put("", millis);
-  timestamps.push_back(std::make_pair("", timestamp));
-
-  // update timestamps in root
-  meta_data_root.erase("timestamps");
-  meta_data_root.add_child("timestamps", timestamps);
-
-  DBUG_VOID_RETURN;
-}
-
-void binlog_cache_data::add_db_metadata(THD *thd, ptree &meta_data_root)
-{
-  DBUG_ENTER("binlog_cache_data::add_db_meta_data");
-  DBUG_ASSERT(opt_binlog_trx_meta_data);
-
-  if (!thd->db_metadata.empty())
-  {
-    ptree db_metadata_root;
-    mysql_mutex_lock(&thd->LOCK_db_metadata);
-    std::istringstream is(thd->db_metadata);
-    mysql_mutex_unlock(&thd->LOCK_db_metadata);
-    try {
-      read_json(is, db_metadata_root);
-    } catch (std::exception& e) {
-      // NO_LINT_DEBUG
-      sql_print_error("Exception while reading meta data: %s, JSON: %s",
-                       e.what(), thd->db_metadata.c_str());
-      DBUG_VOID_RETURN;
-    }
-    for (auto node : db_metadata_root)
-    {
-      if (!meta_data_root.get_child_optional(node.first))
-        meta_data_root.add_child(node.first, node.second);
-    }
-  }
-
-  DBUG_VOID_RETURN;
 }
 
 /**
@@ -2119,6 +2097,21 @@ err:
     end_io_cache(log);
   }
   DBUG_RETURN(-1);
+}
+
+/**
+  This function checks if binlog cache is empty.
+
+  @param thd The client thread that executed the current statement.
+  @return
+    @c true if binlog cache is empty, @c false otherwise.
+*/
+bool
+is_binlog_cache_empty(const THD* thd)
+{
+  binlog_cache_mngr *const cache_mngr= thd_get_cache_mngr(thd);
+
+  return (cache_mngr ? cache_mngr->is_binlog_empty() : 1);
 }
 
 /** 
@@ -6153,39 +6146,40 @@ my_bool mysql_bin_log_is_open(void)
 }
 
 extern "C"
-void mysql_bin_log_lock_commits(void)
+void mysql_bin_log_lock_commits(struct snapshot_info_st *ss_info)
 {
-  mysql_bin_log.lock_commits();
+  mysql_bin_log.lock_commits(ss_info);
 }
 
 extern "C"
-void mysql_bin_log_unlock_commits(char* binlog_file,
-                                  unsigned long long* binlog_pos,
-                                  char** gtid_executed,
-                                  int* gtid_executed_length)
+void mysql_bin_log_unlock_commits(const struct snapshot_info_st *ss_info)
 {
-  mysql_bin_log.unlock_commits(binlog_file, binlog_pos, gtid_executed,
-                               gtid_executed_length);
+  mysql_bin_log.unlock_commits(ss_info);
 }
 
-void MYSQL_BIN_LOG::lock_commits(void)
+void MYSQL_BIN_LOG::lock_commits(snapshot_info_st *ss_info)
 {
   mysql_mutex_lock(&LOCK_log);
   mysql_mutex_lock(&LOCK_sync);
   mysql_mutex_lock(&LOCK_semisync);
   mysql_mutex_lock(&LOCK_commit);
+  ss_info->binlog_file= std::string(log_file_name);
+  ss_info->binlog_pos = my_b_tell(&log_file);
+  global_sid_lock->wrlock();
+  const auto gtids= gtid_state->get_logged_gtids()->to_string();
+  ss_info->gtid_executed = std::string(gtids);
+  my_free(gtids);
+  global_sid_lock->unlock();
 }
 
-void MYSQL_BIN_LOG::unlock_commits(char* binlog_file, ulonglong* binlog_pos,
-                                   char** gtid_executed,
-                                   int* gtid_executed_length)
+void MYSQL_BIN_LOG::unlock_commits(const snapshot_info_st *ss_info)
 {
-  strmake(binlog_file, log_file_name, FN_REFLEN);
-  *binlog_pos = my_b_tell(&log_file);
   global_sid_lock->wrlock();
-  const Gtid_set *logged_gtids= gtid_state->get_logged_gtids();
-  *gtid_executed = logged_gtids->to_string();
-  *gtid_executed_length = logged_gtids->get_string_length();
+  const auto gtids= gtid_state->get_logged_gtids()->to_string();
+  assert(ss_info->binlog_file == std::string(log_file_name) &&
+         ss_info->binlog_pos == my_b_tell(&log_file) &&
+         ss_info->gtid_executed == std::string(gtids));
+  my_free(gtids);
   global_sid_lock->unlock();
   mysql_mutex_unlock(&LOCK_commit);
   mysql_mutex_unlock(&LOCK_semisync);
@@ -6663,6 +6657,14 @@ err:
     write_error= 1;
     sql_print_error(ER(ER_ERROR_ON_WRITE), name,
                     errno, my_strerror(errbuf, sizeof(errbuf), errno));
+  }
+
+  /*
+    If the flush has failed due to ENOSPC, set the flush_error flag.
+  */
+  if (cache->error && thd->is_error() && my_errno == ENOSPC)
+  {
+    cache_data->set_flush_error(thd);
   }
   thd->commit_error= THD::CE_FLUSH_ERROR;
   if (binlog_error_action != IGNORE_ERROR)
@@ -7433,7 +7435,7 @@ MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first, bool async)
       /*
         storage engine commit
       */
-      if (ha_commit_low(head, all, async))
+      if (ha_commit_low(head, all, async, false))
         head->commit_error= THD::CE_COMMIT_ERROR;
     }
     DBUG_PRINT("debug", ("commit_error: %d, flags.pending: %s",
@@ -7451,6 +7453,39 @@ MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first, bool async)
 }
 
 /**
+  Process after commit for a sequence of sessions.
+  @param thd The "master" thread
+  @param first First thread in the queue of threads to commit
+*/
+void
+MYSQL_BIN_LOG::process_after_commit_stage_queue(THD *thd, THD *first,
+                                                bool async)
+{
+  Thread_excursion excursion(thd);
+  for (THD *head= first; head; head= head->next_to_commit)
+  {
+    if (head->transaction.flags.run_hooks &&
+        head->commit_error == THD::CE_NONE)
+    {
+      /*
+        TODO: This hook here should probably move outside/below this
+              if and be the only after_commit invocation left in the
+              code.
+      */
+      excursion.try_to_attach_to(head);
+      bool all= head->transaction.flags.real_commit;
+      (void) RUN_HOOK(transaction, after_commit, (head, all));
+      /*
+        When after_commit finished for the transaction, clear the run_hooks flag.
+        This allow other parts of the system to check if after_commit was called.
+      */
+      head->transaction.flags.run_hooks= false;
+    }
+  }
+}
+
+
+/**
   Scans the semisync queue and calls before_commit hook
   using the last thread in the queue.
 
@@ -7464,16 +7499,9 @@ MYSQL_BIN_LOG::process_semisync_stage_queue(THD *queue_head)
    THD *last_thd = NULL;
    for (THD *thd = queue_head; thd != NULL; thd = thd->next_to_commit)
    {
-      // run_hooks is set to true in ordered_commit() if storage
-      // engine commit is required.
-      if (thd->transaction.flags.run_hooks &&
-          thd->commit_error == THD::CE_NONE)
+      if (thd->commit_error == THD::CE_NONE)
       {
         last_thd = thd;
-        // setting run_hooks to false allows other parts of the system to
-        // check if before commit hook is called for this thread.
-        // Also this avoids assertion in finish_commit.
-        thd->transaction.flags.run_hooks = false;
       }
    }
 
@@ -7665,13 +7693,25 @@ MYSQL_BIN_LOG::finish_commit(THD *thd, bool async)
       storage engine commit
     */
     DBUG_ASSERT(thd->commit_error != THD::CE_COMMIT_ERROR);
-    if (ha_commit_low(thd, all, async))
+    if (ha_commit_low(thd, all, async, false))
       thd->commit_error= THD::CE_COMMIT_ERROR;
     /*
       Decrement the prepared XID counter after storage engine commit
     */
     if (thd->transaction.flags.xid_written)
       dec_prep_xids(thd);
+    /*
+      If commit succeeded, we call the after_commit hook
+
+      TODO: This hook here should probably move outside/below this
+            if and be the only after_commit invocation left in the
+            code.
+    */
+    if ((thd->commit_error == THD::CE_NONE) && thd->transaction.flags.run_hooks)
+    {
+      (void) RUN_HOOK(transaction, after_commit, (thd, all));
+      thd->transaction.flags.run_hooks= false;
+    }
   }
   else if (thd->transaction.flags.xid_written)
     dec_prep_xids(thd);
@@ -7760,6 +7800,14 @@ void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
                       errmsg);
     }
     close(LOG_CLOSE_INDEX|LOG_CLOSE_STOP_EVENT);
+    /*
+      If there is a write error (flush/sync stage) and if
+      binlog_error_action=IGNORE_ERROR, clear the error
+      and allow the commit to happen in storage engine.
+    */
+    if (check_write_error(thd))
+      thd->clear_error();
+
     if (need_lock_log)
       mysql_mutex_unlock(&LOCK_log);
     DEBUG_SYNC(thd, "after_binlog_closed_due_to_error");
@@ -8017,6 +8065,11 @@ commit_stage:
     process_commit_stage_queue(thd, commit_queue, async);
     thd->engine_commit_time = my_timer_since(start_time);
     mysql_mutex_unlock(&LOCK_commit);
+    /*
+      Process after_commit after LOCK_commit is released for avoiding
+      3-way deadlock among user thread, rotate thread and dump thread.
+    */
+    process_after_commit_stage_queue(thd, commit_queue, async);
     final_queue= commit_queue;
   }
   else if (leave_mutex_before_commit_stage)
@@ -8189,6 +8242,27 @@ int MYSQL_BIN_LOG::recover(IO_CACHE *log, Format_description_log_event *fdle,
   if (ha_recover(&xids, engine_binlog_file, &engine_binlog_pos,
                  &engine_binlog_max_gtid))
     goto err2;
+
+  /* If trim binlog on recover option is set, then we essentially trim
+     binlog to the position that the engine thinks it has committed. Note
+     that if opt_trim_binlog option is set, then engine recovery (called
+     through ha_recover() above) ensures that all prepared txns are rolled
+     back. There are a few things which need to be kept in mind:
+     1. txns never span across two binlogs, hence it is safe to recover only
+        the latest binlog file.
+     2. A binlog rotation ensures that the previous binlogs and engine's
+        transaction logs are flushed and made durable. Hence all previous
+        transactions are made durable.
+  */
+  if (opt_trim_binlog)
+  {
+    if (*valid_pos > engine_binlog_pos)
+      *valid_pos = engine_binlog_pos;
+    else if (*valid_pos < engine_binlog_pos)
+      // NO_LINT_DEBUG
+      sql_print_information("Engine is ahead of binlog. Binlog will not be "
+                            "truncated to match engine position.");
+  }
 
   free_root(&mem_root, MYF(0));
   my_hash_free(&xids);
@@ -8387,6 +8461,127 @@ static int binlog_start_trans_and_stmt(THD *thd, Log_event *start_event)
 }
 
 /**
+  This function generated meta data in JSON format as a comment in a rows query
+  event.
+
+  @see binlog_trx_meta_data
+
+  @return JSON if all good, null string otherwise
+*/
+std::string THD::gen_trx_metadata()
+{
+  DBUG_ENTER("THD::gen_trx_metadata");
+  DBUG_ASSERT(opt_binlog_trx_meta_data);
+
+  ptree pt;
+  std::ostringstream buf;
+
+  // case: read existing meta data received from the master
+  if (rli_slave && !rli_slave->trx_meta_data_json.empty())
+  {
+    std::istringstream is(rli_slave->trx_meta_data_json);
+    try {
+      read_json(is, pt);
+    } catch (std::exception& e) {
+      // NO_LINT_DEBUG
+      sql_print_error("Exception while reading meta data: %s, JSON: %s",
+                       e.what(), rli_slave->trx_meta_data_json.c_str());
+      DBUG_RETURN("");
+    }
+    // clear existing data
+    rli_slave->trx_meta_data_json.clear();
+  }
+
+  // add things to the meta data
+  try {
+    add_time_metadata(pt);
+    add_db_metadata(pt);
+  } catch (std::exception& e) {
+      // NO_LINT_DEBUG
+      sql_print_error("Exception while adding meta data: %s", e.what());
+      DBUG_RETURN("");
+  }
+
+  // write meta data with new stuff in the binlog
+  try {
+    write_json(buf, pt, false);
+  } catch (std::exception& e) {
+      // NO_LINT_DEBUG
+      sql_print_error("Exception while writing meta data: %s", e.what());
+      DBUG_RETURN("");
+  }
+  std::string json = buf.str();
+  boost::trim(json);
+
+  std::string comment_str= std::string("/*")
+                           .append(TRX_META_DATA_HEADER)
+                           .append(json)
+                           .append("*/");
+
+  DBUG_RETURN(comment_str);
+}
+
+/**
+  This function adds timing information in meta data JSON of rows query event.
+
+  @see THD::write_trx_metadata
+
+  @param meta_data_root Property tree object which represents the JSON
+*/
+void THD::add_time_metadata(ptree &meta_data_root)
+{
+  DBUG_ENTER("THD::add_time_metadata");
+  DBUG_ASSERT(opt_binlog_trx_meta_data);
+
+  // get existing timestamps
+  ptree timestamps= meta_data_root.get_child("ts", ptree());
+
+  // add our timestamp to the array
+  ptree timestamp;
+  ulonglong millis=
+    std::chrono::duration_cast<std::chrono::milliseconds>
+      (std::chrono::system_clock::now().time_since_epoch()).count();
+  timestamp.put("", millis);
+  timestamps.push_back(std::make_pair("", timestamp));
+
+  // update timestamps in root
+  meta_data_root.erase("ts");
+  meta_data_root.add_child("ts", timestamps);
+
+  DBUG_VOID_RETURN;
+}
+
+void THD::add_db_metadata(ptree &meta_data_root)
+{
+  DBUG_ENTER("THD::add_db_meta_data");
+  DBUG_ASSERT(opt_binlog_trx_meta_data);
+
+  if (!db_metadata.empty())
+  {
+    ptree db_metadata_root;
+    mysql_mutex_lock(&LOCK_db_metadata);
+    std::istringstream is(db_metadata);
+    mysql_mutex_unlock(&LOCK_db_metadata);
+    try {
+      read_json(is, db_metadata_root);
+    } catch (std::exception& e) {
+      // NO_LINT_DEBUG
+      sql_print_error("Exception while reading meta data: %s, JSON: %s",
+                       e.what(), db_metadata.c_str());
+      DBUG_VOID_RETURN;
+    }
+    // flatten DB metadata into trx metadata
+    for (auto& node : db_metadata_root)
+    {
+      if (!meta_data_root.get_child_optional(node.first))
+        meta_data_root.add_child(node.first, node.second);
+    }
+  }
+
+  DBUG_VOID_RETURN;
+}
+
+/**
   This function writes a table map to the binary log. 
   Note that in order to keep the signature uniform with related methods,
   we use a redundant parameter to indicate whether a transactional table
@@ -8428,22 +8623,24 @@ int THD::binlog_write_table_map(TABLE *table, bool is_transactional,
   binlog_cache_data *cache_data=
     cache_mngr->get_binlog_cache_data(is_transactional);
 
-  bool write_rows_query= binlog_rows_query && this->query();
-  if (write_rows_query)
+  if (binlog_rows_query)
   {
-    /* Write the Rows_query_log_event into binlog before the table map */
-    Rows_query_log_event
-      rows_query_ev(this, this->query(), this->query_length());
-    if ((error= cache_data->write_event(this, &rows_query_ev,
-                                        opt_binlog_trx_meta_data)))
-      DBUG_RETURN(error);
+    std::string query;
+    if (opt_binlog_trx_meta_data)
+      query.append(gen_trx_metadata());
+    if (variables.binlog_rows_query_log_events && this->query())
+      query.append(this->query(), this->query_length());
+
+    if (!query.empty())
+    {
+      /* Write the Rows_query_log_event into binlog before the table map */
+      Rows_query_log_event rows_query_ev(this, query.c_str(), query.length());
+      if ((error= cache_data->write_event(this, &rows_query_ev)))
+        DBUG_RETURN(error);
+    }
   }
 
-  if ((error= cache_data->write_event(this, &the_event,
-                                      // write meta data only if not written
-                                      // before rows query event
-                                      !write_rows_query &&
-                                      opt_binlog_trx_meta_data)))
+  if ((error= cache_data->write_event(this, &the_event)))
     DBUG_RETURN(error);
 
   binlog_table_maps++;
@@ -9480,6 +9677,7 @@ THD::binlog_prepare_pending_rows_event(TABLE* table, uint32 serv_id,
       pending->get_table_id() != table->s->table_map_id ||
       pending->get_general_type_code() != general_type_code ||
       pending->get_data_size() + needed > opt_binlog_rows_event_max_size ||
+      pending->m_row_count >= opt_binlog_rows_event_max_rows ||
       pending->read_write_bitmaps_cmp(table) == FALSE ||
       !binlog_row_event_extra_data_eq(pending->get_extra_row_data(),
                                       extra_row_info))
@@ -10138,6 +10336,30 @@ void THD::issue_unsafe_warnings()
         else //cases other than LIMIT unsafety
           print_unsafe_warning_to_log(unsafe_type, buf, query());
       }
+    }
+  }
+
+  /*  If this statement is unsafe for SBR, then log the query to slow log */
+  if (log_sbr_unsafe && opt_slow_log && lex->is_stmt_unsafe() &&
+      !log_throttle_sbr_unsafe_query.log(this, true))
+  {
+    // Prefix the log so it can be mined later
+    const char* sbr_unsafe_log_prefix = "SBR_UNSAFE: ";
+    size_t prefix_len = strlen(sbr_unsafe_log_prefix);
+    size_t log_len = prefix_len + query_length();
+
+    char* log_line = (char *)my_malloc(log_len + 1, MYF(MY_WME));
+    if (log_line)
+    {
+      memcpy(log_line, sbr_unsafe_log_prefix, prefix_len);
+      memcpy(log_line + prefix_len, query(), query_length());
+      log_line[log_len] = 0;
+       // Now log into slow log
+      bool old_enable_slow_log = enable_slow_log;
+      enable_slow_log = TRUE;
+      slow_log_print(this, log_line, log_len, &status_var);
+      my_free(log_line);
+      enable_slow_log = old_enable_slow_log; // Restore old value
     }
   }
   DBUG_VOID_RETURN;

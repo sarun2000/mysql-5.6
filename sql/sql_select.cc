@@ -2809,7 +2809,7 @@ bool JOIN::setup_materialized_table(JOIN_TAB *tab, uint tableno,
 bool
 make_join_readinfo(JOIN *join, ulonglong options, uint no_jbuf_after)
 {
-  const bool statistics= MY_TEST(!(join->select_options & SELECT_DESCRIBE));
+  const bool statistics= MY_TEST(!(join->thd->lex->select_lex.options & SELECT_DESCRIBE));
 
   DBUG_ENTER("make_join_readinfo");
 
@@ -2900,7 +2900,15 @@ make_join_readinfo(JOIN *join, ulonglong options, uint no_jbuf_after)
 	  {
 	    join->thd->set_status_no_index_used();
 	    if (statistics)
+	    {
 	      join->thd->inc_status_select_scan();
+	      /* Block full table/index scans, if optimizer_full_scan is off. */
+	      if (!join->thd->variables.optimizer_full_scan)
+	      {
+	        my_error(ER_FULL_SCAN_DISABLED, MYF(0));
+	        DBUG_RETURN(TRUE);
+	      }
+	    }
 	  }
 	}
 	else
@@ -2914,7 +2922,15 @@ make_join_readinfo(JOIN *join, ulonglong options, uint no_jbuf_after)
 	  {
 	    join->thd->set_status_no_index_used();
 	    if (statistics)
+	    {
 	      join->thd->inc_status_select_full_join();
+	      /* Block full table/index scans, if optimizer_full_scan is off. */
+	      if (!join->thd->variables.optimizer_full_scan)
+	      {
+	        my_error(ER_FULL_SCAN_DISABLED, MYF(0));
+	        DBUG_RETURN(TRUE);
+	      }
+	    }
 	  }
 	}
 	if (!table->no_keyread)
@@ -5665,8 +5681,11 @@ test_if_cheaper_ordering(const JOIN_TAB *tab, ORDER *order, TABLE *table,
           In any case we can't select more than #table_records.
           N/(refkey_rows_estimate/table_records) > table_records
           <=> N > refkey_rows_estimate.
+
+          Do not apply this heuristic if optimizer_low_limit_heuristic is off.
          */
-        if (select_limit > refkey_rows_estimate)
+        if (select_limit > refkey_rows_estimate ||
+            !table->in_use->variables.optimizer_low_limit_heuristic)
           select_limit= table_records;
         else
           select_limit= (ha_rows) (select_limit *

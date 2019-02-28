@@ -27,9 +27,9 @@
 namespace myrocks {
 
 Rdb_index_merge::Rdb_index_merge(const char *const tmpfile_path,
-                                 const ulonglong &merge_buf_size,
-                                 const ulonglong &merge_combine_read_size,
-                                 const ulonglong &merge_tmp_file_removal_delay,
+                                 const ulonglong merge_buf_size,
+                                 const ulonglong merge_combine_read_size,
+                                 const ulonglong merge_tmp_file_removal_delay,
                                  rocksdb::ColumnFamilyHandle *cf)
     : m_tmpfile_path(tmpfile_path), m_merge_buf_size(merge_buf_size),
       m_merge_combine_read_size(merge_combine_read_size),
@@ -52,6 +52,11 @@ Rdb_index_merge::~Rdb_index_merge() {
       }
 
       my_sleep(m_merge_tmp_file_removal_delay * 1000);
+      // Not aborting on fsync error since the tmp file is not used anymore
+      if (mysql_file_sync(m_merge_file.m_fd, MYF(MY_WME))) {
+        // NO_LINT_DEBUG
+        sql_print_error("Error flushing truncated MyRocks merge buffer.");
+      }
       curr_size -= m_merge_buf_size;
     }
   }

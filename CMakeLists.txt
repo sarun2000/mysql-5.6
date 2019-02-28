@@ -173,6 +173,7 @@ ENDIF()
 INCLUDE(character_sets)
 INCLUDE(cpu_info)
 INCLUDE(zlib)
+INCLUDE(zstd)
 INCLUDE(libevent)
 INCLUDE(ssl)
 INCLUDE(readline)
@@ -210,6 +211,20 @@ include(CheckCXXSourceCompiles)
 MACRO (MY_CHECK_C_COMPILER_FLAG FLAG RESULT)
   SET(SAVE_CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
   SET(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${FLAG}")
+  # As mentioned above, CMAKE_C_SOURCE_COMPILES not only compiles the source
+  # but also performs linking to create the binary. The problem is that cmake
+  # automatically appends CFLAGS to the linker command, and there's no way to
+  # stop that.
+  # When '-nostdinc' option is included in CFLAGS, clang spits
+  # 'unused-command-line-argument' warning as the option is only valid for
+  # a compiler but not for a linker. Here we temporarily silience the warning
+  # for linking to pass the check. The warning is still enabled for the
+  # compilation command.
+  IF(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    SET(SAVE_CMAKE_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
+    SET(CMAKE_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}
+        -Wno-unused-command-line-argument")
+  ENDIF()
   CHECK_C_SOURCE_COMPILES("int main(void) { return 0; }" ${RESULT}
     FAIL_REGEX "argument unused during compilation"
     FAIL_REGEX "unsupported .*option"
@@ -219,11 +234,19 @@ MACRO (MY_CHECK_C_COMPILER_FLAG FLAG RESULT)
     FAIL_REGEX "[Ww]arning: [Oo]ption"
     )
   SET(CMAKE_REQUIRED_FLAGS "${SAVE_CMAKE_REQUIRED_FLAGS}")
+  IF(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    SET(CMAKE_REQUIRED_LIBRARIES "${SAVE_CMAKE_REQUIRED_LIBRARIES}")
+  ENDIF()
 ENDMACRO()
 
 MACRO (MY_CHECK_CXX_COMPILER_FLAG FLAG RESULT)
   SET(SAVE_CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
   SET(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${FLAG}")
+  IF(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    SET(SAVE_CMAKE_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
+    SET(CMAKE_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}
+        -Wno-unused-command-line-argument")
+  ENDIF()
   CHECK_CXX_SOURCE_COMPILES("int main(void) { return 0; }" ${RESULT}
     FAIL_REGEX "argument unused during compilation"
     FAIL_REGEX "unsupported .*option"
@@ -233,6 +256,9 @@ MACRO (MY_CHECK_CXX_COMPILER_FLAG FLAG RESULT)
     FAIL_REGEX "[Ww]arning: [Oo]ption"
     )
   SET(CMAKE_REQUIRED_FLAGS "${SAVE_CMAKE_REQUIRED_FLAGS}")
+  IF(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    SET(CMAKE_REQUIRED_LIBRARIES "${SAVE_CMAKE_REQUIRED_LIBRARIES}")
+  ENDIF()
 ENDMACRO()
 
 MACRO(MY_SANITIZER_CHECK SAN_OPT RESULT)
@@ -255,14 +281,22 @@ MACRO(MY_SANITIZER_CHECK SAN_OPT RESULT)
     SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO
       "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${SAN_OPT} -fPIC")
 
-    IF(WITH_FB_TSAN)
-      # fPIC implies PIC version of the TSan library.
-      SET(CMAKE_C_STANDARD_LIBRARIES " -ltsan_pic")
-      SET(CMAKE_CXX_STANDARD_LIBRARIES " -ltsan_pic")
-    ELSEIF(WITH_TSAN)
-      # This combination is tested only on Ubuntu 15.10. YMMV on other OS-s.
-      SET(CMAKE_C_STANDARD_LIBRARIES " -static-libtsan")
-      SET(CMAKE_CXX_STANDARD_LIBRARIES " -static-libtsan")
+    IF (NOT (CMAKE_C_COMPILER_ID MATCHES "Clang"))
+      IF(WITH_FB_TSAN)
+        # fPIC implies PIC version of the TSan library.
+        SET(CMAKE_C_STANDARD_LIBRARIES " -ltsan_pic")
+        SET(CMAKE_CXX_STANDARD_LIBRARIES " -ltsan_pic")
+      ELSEIF(WITH_TSAN)
+        # This combination is tested only on Ubuntu 15.10. YMMV on other OS-s.
+        SET(CMAKE_C_STANDARD_LIBRARIES " -static-libtsan")
+        SET(CMAKE_CXX_STANDARD_LIBRARIES " -static-libtsan")
+      ENDIF()
+    ELSE()
+      if (DEFINED ENV{SAN_SYMBOLIZER_FLAGS})
+        MESSAGE(STATUS "SAN_SYMBOLIZER_FLAGS defined")
+        SET(CMAKE_EXE_LINKER_FLAGS
+            "${CMAKE_EXE_LINKER_FLAGS} $ENV{SAN_SYMBOLIZER_FLAGS}")
+      ENDIF()
     ENDIF()
 
     SET(${RESULT} 1)
@@ -475,6 +509,8 @@ INCLUDE_DIRECTORIES(${CMAKE_CURRENT_BINARY_DIR}/include)
 
 # Add bundled or system zlib.
 MYSQL_CHECK_ZLIB_WITH_COMPRESS()
+# Add zstd.
+MYSQL_CHECK_ZSTD()
 # Add bundled yassl/taocrypt or system openssl.
 MYSQL_CHECK_SSL()
 # Find system readline.

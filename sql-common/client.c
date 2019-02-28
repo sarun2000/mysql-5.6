@@ -4082,10 +4082,18 @@ static int run_ssl_connect(MCPVIO_EXT *mpvio, my_bool *error) {
     switch (ret) {
       case VIO_SOCKET_WANT_READ:
         net->async_blocking_state = NET_NONBLOCKING_READ;
-      DBUG_RETURN(NET_ASYNC_NOT_READY);
+        DBUG_RETURN(NET_ASYNC_NOT_READY);
       case VIO_SOCKET_WANT_WRITE:
         net->async_blocking_state = NET_NONBLOCKING_WRITE;
-      DBUG_RETURN(NET_ASYNC_NOT_READY);
+        DBUG_RETURN(NET_ASYNC_NOT_READY);
+      case VIO_SOCKET_READ_TIMEOUT:
+        *error = TRUE;
+        set_mysql_error(mysql, CR_NET_READ_INTERRUPTED, unknown_sqlstate);
+        DBUG_RETURN(NET_ASYNC_COMPLETE);
+      case VIO_SOCKET_WRITE_TIMEOUT:
+        *error = TRUE;
+        set_mysql_error(mysql, CR_NET_WRITE_INTERRUPTED, unknown_sqlstate);
+        DBUG_RETURN(NET_ASYNC_COMPLETE);
       default:
         break;
         /* continue for error handling */
@@ -7526,11 +7534,12 @@ int STDCALL mysql_resp_attr_find(MYSQL *mysql,
   const char *val;
   size_t keylen;
   size_t vallen;
+  size_t lookup_len = strlen(lookup);
 
   ret = mysql_resp_attr_get_first(mysql, &key, &keylen, &val, &vallen);
   while (!ret)
   {
-    if (strncmp(lookup, key, keylen) == 0)
+    if (lookup_len == keylen && strncmp(lookup, key, keylen) == 0)
     {
       *data = val;
       *length = vallen;

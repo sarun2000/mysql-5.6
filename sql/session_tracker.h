@@ -102,6 +102,9 @@ public:
 
   virtual void claim_memory_ownership()
   {}
+
+  virtual void audit_tracker(std::map<std::string, std::string>& audit_map)
+  {}
 };
 
 
@@ -132,6 +135,8 @@ private:
     return *this;
   }
 
+  std::map<std::string, std::string> audit_attrs;
+
 public:
 
   /** Constructor */
@@ -161,7 +166,8 @@ public:
 
   /**
     Stores the session state change information of all changes session state
-    type entities into the specified buffer.
+    type entities into the specified buffer. Passes the audit map so each
+    tracker can choose what to expose to the audit plugin
   */
   void store(THD *thd, String &main_buf);
   void deinit()
@@ -171,6 +177,14 @@ public:
   }
 
   void claim_memory_ownership();
+
+  const std::map<std::string, std::string>& get_audit_attrs() const {
+    return audit_attrs;
+  }
+
+  void reset_audit_attrs() {
+    audit_attrs.clear();
+  }
 };
 
 /*
@@ -197,7 +211,7 @@ public:
   bool enable(THD *thd) override;
   bool check(THD *thd, set_var *var) override
   { return false; }
-  bool force_enable();
+  bool force_enable() override;
   bool update(THD *thd) override;
   bool store(THD *thd, String &buf) override;
   void mark_as_changed(THD *thd, LEX_CSTRING *tracked_item_name,
@@ -220,17 +234,20 @@ private:
   Session_resp_attr_tracker& operator=(const Session_resp_attr_tracker&) =
       delete;
 
+  bool m_forced_enabled; // Override the variable to force this as enabled
   std::map<std::string, std::string> attrs_;
 
 public:
-  Session_resp_attr_tracker() { m_changed = false; m_enabled = true; }
+  Session_resp_attr_tracker()
+  { m_forced_enabled = false; m_changed = false; m_enabled = false; }
 
-  bool enable(THD *thd) override { return false; }
-  bool force_enable() override { return false; }
+  bool enable(THD *thd) override;
+  bool force_enable() override { m_forced_enabled = true; return false; }
   bool check(THD *thd, set_var *var) override { return false; }
-  bool update(THD *thd) override { return false; }
+  bool update(THD *thd) override { return enable(thd); }
   bool store(THD *thd, String &buf) override;
   void mark_as_changed(THD *thd, LEX_CSTRING *key, LEX_CSTRING *value) override;
+  void audit_tracker(std::map<std::string, std::string>& audit_map) override;
 };
 
 #endif /* SESSION_TRACKER_INCLUDED */

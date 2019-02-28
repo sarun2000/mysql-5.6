@@ -32,6 +32,7 @@
 #include "sql_list.h"                      /* I_List */
 #include "sql_cmd.h"                       /* SQLCOM_END */
 #include "my_rdtsc.h"                      /* my_timer* */
+#include "hh_wheel_timer.h"                /* hhWheelTimer */
 #include <set>
 #include "sql_priv.h"                      /* enum_var_type */
 // for unix sockets
@@ -55,6 +56,8 @@ typedef std::set<int> engine_set;
 /* Store all engines that support handler::flush_logs into global_trx_engine.*/
 extern engine_set global_trx_engine;
 extern my_bool plugins_are_initialized;
+
+extern std::unique_ptr<HHWheelTimer> hhWheelTimer;
 
 typedef struct lsn_map
 {
@@ -249,6 +252,7 @@ bool is_secure_file_path(char *path);
 bool is_mysql_datadir_path(const char *path);
 void dec_connection_count_locked();
 void dec_connection_count();
+void delete_pid_file(myf flags);
 
 // These are needed for unit testing.
 void set_remaining_args(int argc, char **argv);
@@ -273,7 +277,8 @@ extern const char* mysql_compression_lib_names[3];
 
 extern MY_BITMAP temp_pool;
 extern bool opt_large_files, server_id_supplied;
-extern bool opt_update_log, opt_bin_log, opt_error_log;
+extern bool opt_update_log, opt_bin_log, opt_error_log, opt_trim_binlog;
+extern  my_bool rpl_slave_flow_control;
 extern bool opt_improved_dup_key_error;
 extern my_bool opt_log, opt_slow_log, opt_log_raw;
 extern char* opt_gap_lock_logname;
@@ -285,6 +290,8 @@ extern ulong log_backup_output_options;
 extern my_bool opt_log_queries_not_using_indexes;
 extern ulong opt_log_throttle_queries_not_using_indexes;
 extern ulong opt_log_throttle_legacy_user;
+extern ulong opt_log_throttle_sbr_unsafe_queries;
+extern bool log_sbr_unsafe;
 extern my_bool opt_disable_working_set_size;
 extern bool opt_disable_networking, opt_skip_show_db;
 extern bool opt_skip_name_resolve;
@@ -302,8 +309,12 @@ extern my_bool opt_safe_show_db, opt_local_infile, opt_myisam_use_mmap;
 extern my_bool opt_slave_compressed_protocol, use_temp_pool;
 extern my_bool opt_slave_compressed_event_protocol;
 extern ulonglong opt_max_compressed_event_cache_size;
+extern ulonglong opt_compressed_event_cache_evict_threshold;
 extern ulong opt_slave_compression_lib;
+extern ulonglong opt_slave_dump_thread_wait_sleep_usec;
 extern my_bool rpl_wait_for_semi_sync_ack;
+extern std::atomic<ulonglong> slave_lag_sla_misses;
+extern ulonglong opt_slave_lag_sla_seconds;
 extern ulong slave_exec_mode_options;
 extern ulong slave_use_idempotent_for_recovery_options;
 extern ulong slave_run_triggers_for_rbr;
@@ -399,6 +410,7 @@ extern ulong relay_io_events, relay_sql_events;
 extern ulonglong relay_io_bytes, relay_sql_bytes;
 extern ulonglong relay_sql_wait_time;
 extern double comp_event_cache_hit_ratio;
+extern ulonglong repl_semi_sync_master_ack_waits;
 extern my_bool recv_skip_ibuf_operations;
 
 /* SHOW STATS var: Name of current timer */
@@ -623,7 +635,11 @@ void counter_histogram_increment(counter_histogram* current_histogram,
 */
 ulonglong latency_histogram_get_count(latency_histogram* current_histogram,
                                      size_t bin_num);
-
+/**
+ * Update the nice value of a thread
+ * @param thd_id_nice_val threadId:niceVal
+ * **/
+bool update_thread_nice_value(char *thd_id_nice_val);
 /**
   Validate if the string passed to the configurable histogram step size
   conforms to proper syntax.
@@ -633,6 +649,12 @@ ulonglong latency_histogram_get_count(latency_histogram* current_histogram,
   @return                     1 if invalid, 0 if valid.
 */
 int histogram_validate_step_size_string(const char* step_size_with_unit);
+
+#ifdef HAVE_JEMALLOC
+#ifndef EMBEDDED_LIBRARY
+extern bool enable_jemalloc_hppfunc(char *);
+#endif
+#endif
 
 /** To return the displayable histogram name from
   my_timer_to_display_string() */
@@ -857,6 +879,8 @@ extern ulong opt_max_running_queries, opt_max_waiting_queries;
 extern my_bool opt_admission_control_by_trx;
 extern my_bool opt_slave_allow_batching;
 extern my_bool allow_slave_start;
+extern char *enable_jemalloc_hpp;
+extern char *thread_nice_value;
 extern LEX_CSTRING reason_slave_blocked;
 extern ulong slave_trans_retries;
 extern uint  slave_net_timeout;
@@ -874,6 +898,7 @@ extern ulong rpl_stop_slave_timeout;
 extern my_bool rpl_skip_tx_api;
 extern my_bool log_bin_use_v1_row_events;
 extern ulong what_to_log,flush_time;
+extern bool flush_only_old_table_cache_entries;
 extern ulong max_prepared_stmt_count, prepared_stmt_count;
 extern ulong open_files_limit;
 extern ulong binlog_cache_size, binlog_stmt_cache_size;
@@ -881,6 +906,7 @@ extern ulonglong max_binlog_cache_size, max_binlog_stmt_cache_size;
 extern ulong max_binlog_size, max_relay_log_size;
 extern ulong slave_max_allowed_packet;
 extern ulong opt_binlog_rows_event_max_size;
+extern ulonglong opt_binlog_rows_event_max_rows;
 extern bool opt_log_only_query_comments;
 extern bool opt_binlog_trx_meta_data;
 extern bool opt_log_column_names;
@@ -1097,6 +1123,7 @@ extern PSI_mutex_key key_RELAYLOG_LOCK_binlog_end_pos;
 extern PSI_mutex_key key_LOCK_sql_rand;
 extern PSI_mutex_key key_gtid_ensure_index_mutex;
 extern PSI_mutex_key key_LOCK_thread_created;
+extern PSI_mutex_key key_LOCK_log_throttle_sbr_unsafe;
 
 extern PSI_rwlock_key key_rwlock_LOCK_grant, key_rwlock_LOCK_logger,
   key_rwlock_LOCK_sys_init_connect, key_rwlock_LOCK_sys_init_slave,
@@ -1271,7 +1298,10 @@ extern PSI_stage_info stage_slave_waiting_worker_to_release_partition;
 extern PSI_stage_info stage_slave_waiting_worker_to_free_events;
 extern PSI_stage_info stage_slave_waiting_worker_queue;
 extern PSI_stage_info stage_slave_waiting_event_from_coordinator;
+extern PSI_stage_info stage_slave_waiting_for_dependencies;
+extern PSI_stage_info stage_slave_waiting_semi_sync_ack;
 extern PSI_stage_info stage_slave_waiting_workers_to_exit;
+extern PSI_stage_info stage_slave_waiting_for_dependency_workers;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
 /**
   Statement instrumentation keys (sql).
@@ -1325,6 +1355,9 @@ extern char mysql_unpacked_real_data_home[];
 extern MYSQL_PLUGIN_IMPORT struct system_variables global_system_variables;
 extern char default_logfile_name[FN_REFLEN];
 
+extern std::atomic_ullong init_global_rolock_timer;
+extern std::atomic_ullong init_commit_lock_timer;
+
 #define mysql_tmpdir (my_tmpdir(&mysql_tmpdir_list))
 
 /* Time handling client commands for replication */
@@ -1344,7 +1377,9 @@ extern mysql_mutex_t
        LOCK_global_system_variables, LOCK_user_conn, LOCK_log_throttle_qni,
        LOCK_log_throttle_legacy,
        LOCK_prepared_stmt_count, LOCK_error_messages, LOCK_connection_count,
-       LOCK_sql_slave_skip_counter, LOCK_slave_net_timeout;
+       LOCK_sql_slave_skip_counter, LOCK_slave_net_timeout,
+       LOCK_log_throttle_sbr_unsafe;
+
 #ifdef HAVE_OPENSSL
 extern char* des_key_file;
 extern mysql_mutex_t LOCK_des_key_file;
@@ -1437,6 +1472,7 @@ enum options_mysqld
   OPT_LOG_SLOW_EXTRA,
   OPT_SLOW_LOG_IF_ROWS_EXAMINED_EXCEED,
   OPT_PROCESS_CAN_DISABLE_BIN_LOG,
+  OPT_TRIM_BINLOG_TO_RECOVER,
 };
 
 

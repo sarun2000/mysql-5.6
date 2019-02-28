@@ -47,6 +47,7 @@
 #include "debug_sync.h"
 #include "sql_show.h"
 #include "sql_multi_tenancy.h"
+#include "srv_session.h"
 
 #define MAX_DROP_TABLE_Q_LEN      1024
 
@@ -307,6 +308,31 @@ end:
   DBUG_RETURN(error);
 }
 
+#ifndef EMBEDDED_LIBRARY
+static
+void add_srv_sessions(std::vector<std::shared_ptr<Srv_session>> &sessions,
+                      std::set<THD*> &global_thread_list)
+{
+  // In addition to the THDs in global_thread_list, we also have THDs that are
+  // in the srv_session map, and also THDs that are on regular connection THDs
+  // but are part of the default_srv_session field. We need to also include
+  // those THDs.
+  //
+  // The long term fix is just to integrate these sessions into
+  // global_thread_list.
+  for (THD *tmp : global_thread_list) {
+    if (tmp->get_default_srv_session() != nullptr) {
+      sessions.push_back(tmp->get_default_srv_session());
+    }
+  }
+
+  for (const auto& srv_session : sessions)
+  {
+    global_thread_list.insert(srv_session->get_thd());
+  }
+}
+#endif
+
 /* Delete db opt from all thread's local hash maps */
 static void del_thd_db_read_only(my_dbopt_t *opt)
 {
@@ -318,6 +344,12 @@ static void del_thd_db_read_only(my_dbopt_t *opt)
   std::set<THD*> global_thread_list_copy;
   mutex_lock_all_shards(SHARDED(&LOCK_thd_remove));
   copy_global_thread_list(&global_thread_list_copy);
+
+#ifndef EMBEDDED_LIBRARY
+  // session_list needs to be in this scope to keep the shared_ptrs alive.
+  auto session_list = Srv_session::get_sorted_sessions();
+  add_srv_sessions(session_list, global_thread_list_copy);
+#endif
 
   std::set<THD*>::iterator it= global_thread_list_copy.begin();
   std::set<THD*>::iterator end= global_thread_list_copy.end();
@@ -444,6 +476,12 @@ static void update_thd_db_read_only(const char *path, uchar db_read_only)
   mutex_lock_all_shards(SHARDED(&LOCK_thd_remove));
   copy_global_thread_list(&global_thread_list_copy);
 
+#ifndef EMBEDDED_LIBRARY
+  // session_list needs to be in this scope to keep the shared_ptrs alive.
+  auto session_list = Srv_session::get_sorted_sessions();
+  add_srv_sessions(session_list, global_thread_list_copy);
+#endif
+
   std::set<THD*>::iterator it= global_thread_list_copy.begin();
   std::set<THD*>::iterator end= global_thread_list_copy.end();
   for (; it != end; ++it)
@@ -496,6 +534,12 @@ static void update_thd_db_metadata(const char *db_name,
   std::set<THD*> global_thread_list_copy;
   mutex_lock_all_shards(SHARDED(&LOCK_thd_remove));
   copy_global_thread_list(&global_thread_list_copy);
+
+#ifndef EMBEDDED_LIBRARY
+  // session_list needs to be in this scope to keep the shared_ptrs alive.
+  auto session_list = Srv_session::get_sorted_sessions();
+  add_srv_sessions(session_list, global_thread_list_copy);
+#endif
 
   std::set<THD*>::iterator it= global_thread_list_copy.begin();
   std::set<THD*>::iterator end= global_thread_list_copy.end();
@@ -554,6 +598,10 @@ static bool write_db_opt(THD *thd, const char *db_name, const char *path,
   if (create->db_read_only == enum_db_read_only::DB_READ_ONLY_NULL)
     create->db_read_only = db_info.db_read_only;
 
+  /* if db_metadata is not specified, use the current value */
+  if (!create->alter_db_metadata)
+    create->db_metadata = db_info.db_metadata;
+
   if (put_dbopt(path, create))
     return 1;
 
@@ -572,9 +620,7 @@ static bool write_db_opt(THD *thd, const char *db_name, const char *path,
                                 enum_db_read_only::DB_READ_ONLY_SUPER? "2":"0",
                               "\ndb-metadata=",
                               create->db_metadata.ptr()?
-                                (const char*)(create->db_metadata.ptr()):
-                                  !db_info.db_metadata.is_empty()?
-                                    (const char*)(db_info.db_metadata.ptr()):"",
+                                (const char*)(create->db_metadata.ptr()):"",
                               "\n", NullS) - buf);
 
     /* Error is written by mysql_file_write */
@@ -621,7 +667,9 @@ bool load_db_opt(THD *thd, const char *path, HA_CREATE_INFO *create,
   bool error=1;
   uint nbytes;
 
-  memset(create, 0, sizeof(*create));
+  // Zero HA_CREATE_INFO structure as it may contain unwanted values
+  create->reset();
+
   create->default_table_charset= thd->variables.collation_server;
 
   /* Check if options for this database are already in the hash */
@@ -1044,6 +1092,17 @@ exit:
   DBUG_RETURN(error);
 }
 
+static void set_change_db_resp_attr(
+    THD *thd)
+{
+  auto tracker = thd->session_tracker.get_tracker(SESSION_RESP_ATTR_TRACKER);
+  if (tracker->is_enabled() && thd->db != nullptr) {
+    static LEX_CSTRING key = { STRING_WITH_LEN("change_db") };
+
+    LEX_CSTRING value = { thd->db, strlen(thd->db) };
+    tracker->mark_as_changed(thd, &key, &value);
+  }
+}
 
 /**
   Drop all tables, routines and events in a database and the database itself.
@@ -1903,6 +1962,7 @@ bool mysql_change_db(THD *thd, const LEX_STRING *new_db_name, bool force_switch)
 done:
   if (thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)->is_enabled())
     thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)->mark_as_changed(thd, NULL);
+  set_change_db_resp_attr(thd);
   DBUG_RETURN(FALSE);
 }
 

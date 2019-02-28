@@ -2105,7 +2105,10 @@ int io_thread_init_commands(MYSQL *mysql, Master_info *mi)
   int ret= 0;
   DBUG_EXECUTE_IF("fake_5_5_version_slave", return ret;);
 
-  sprintf(query, "SET @slave_uuid= '%s'", server_uuid);
+  sprintf(query, "SET "
+                 "@slave_uuid= '%s',"
+                 "@dump_thread_wait_sleep_usec= %llu",
+          server_uuid, opt_slave_dump_thread_wait_sleep_usec);
   if (mysql_real_query(mysql, query, strlen(query))
       && !check_io_slave_killed(mi->info_thd, mi, NULL))
     goto err;
@@ -3233,7 +3236,6 @@ bool show_slave_status(THD* thd, Master_info* mi)
   if (mi != NULL && mi->host[0])
   {
     DBUG_PRINT("info",("host is set: '%s'", mi->host));
-    String *packet= &thd->packet;
     protocol->prepare_for_resend();
 
     /*
@@ -3532,7 +3534,9 @@ bool show_slave_status(THD* thd, Master_info* mi)
     mysql_mutex_unlock(&mi->rli->data_lock);
     mysql_mutex_unlock(&mi->data_lock);
 
-    if (my_net_write(&thd->net, (uchar*) thd->packet.ptr(), packet->length()))
+    String* packet = protocol->storage_packet();
+    if (my_net_write(&protocol->get_thd()->net, (uchar*) packet->ptr(),
+                     packet->length()))
     {
       my_free(sql_gtid_set_buffer);
       my_free(io_gtid_set_buffer);
@@ -4162,7 +4166,7 @@ apply_event_and_update_pos(Log_event** ptr_ev, THD* thd, Relay_log_info* rli)
       if (opt_mts_dependency_replication)
       {
         DBUG_ASSERT(ev->worker == NULL);
-        ev->add_to_dag(rli);
+        ev->schedule_dep(rli);
       }
       else if (ev->worker)
       {
@@ -4764,11 +4768,10 @@ static int exec_relay_log_event(THD* thd, Relay_log_info* rli)
         used to read info about the relay log's format; it will be deleted when
         the SQL thread does not need it, i.e. when this thread terminates.
         ROWS_QUERY_LOG_EVENT is destroyed at the end of the current statement
-        clean-up routine but ones with trx meta data are deleted here.
+        clean-up routine.
       */
       if (ev->get_type_code() != FORMAT_DESCRIPTION_EVENT &&
-          !(ev->get_type_code() == ROWS_QUERY_LOG_EVENT &&
-            !((Rows_query_log_event*) ev)->has_trx_meta_data()))
+          ev->get_type_code() != ROWS_QUERY_LOG_EVENT)
       {
         DBUG_PRINT("info", ("Deleting the event after it has been executed"));
         delete ev;
@@ -5289,6 +5292,8 @@ Stopping slave I/O thread due to out-of-memory error from master");
                                        current_thd,
                                        STRING_WITH_LEN(act)));
                       }});
+
+      DBUG_EXECUTE_IF("error_before_semi_sync_reply", goto err;);
 
       if (RUN_HOOK(binlog_relay_io, after_queue_event,
                    (thd, mi, event_buf, event_len, synced)))
@@ -6393,63 +6398,29 @@ void slave_stop_workers(Relay_log_info *rli, bool *mts_inited)
 
   if (opt_mts_dependency_replication)
   {
-    for (;;)
+    mysql_mutex_lock(&rli->dep_lock);
+    // figure out if any worker thread is working on a partially scheduled
+    // transaction, i.e. if the queue is empty and the SQL thread is maintaning
+    // a begin event
+    const bool partial= rli->dep_queue.empty() &&
+                        rli->current_begin_event != nullptr;
+    // case: clear all buffered transactions if UNTIL condition is not specified
+    if (likely(rli->until_condition == Relay_log_info::UNTIL_NONE))
     {
-      PSI_stage_info old_stage;
-      const auto WAIT_FOR_DAG_EMPTY= 2;
-      struct timespec dag_empty_timeout;
-      set_timespec(dag_empty_timeout, WAIT_FOR_DAG_EMPTY);
-
-      // timed wait till DAG is empty
-      mysql_mutex_lock(&rli->dag_empty_mutex);
-      thd->ENTER_COND(&rli->dag_empty_cond, &rli->dag_empty_mutex,
-          &stage_slave_waiting_workers_to_exit, &old_stage);
-
-      if (!rli->dag_empty)
-        mysql_cond_timedwait(&rli->dag_empty_cond,
-                             &rli->dag_empty_mutex,
-                             &dag_empty_timeout);
-
-      thd->EXIT_COND(&old_stage);
-
-      // check if workers already bailed due to error
-      bool workers_errored_out= true;
-      for (int i= rli->workers.elements - 1; i >= 0; i--)
-      {
-        Slave_worker *w;
-        get_dynamic((DYNAMIC_ARRAY*)&rli->workers, (uchar*) &w, i);
-        mysql_mutex_lock(&w->jobs_lock);
-        if (w->running_status == Slave_worker::RUNNING)
-        {
-          workers_errored_out= false;
-          mysql_mutex_unlock(&w->jobs_lock);
-          break;
-        }
-        mysql_mutex_unlock(&w->jobs_lock);
-      }
-      if (workers_errored_out) break;
-
-      // If *all* nodes in the head of the DAG are group start nodes whose
-      // whole group is not yet in the DAG we can discard them because that
-      // condition cannot be satisfied now that the SQL thread is stopped
-      rli->dag_rdlock();
-      bool good_to_break= true;
-      for (auto& node : rli->dag.get_head())
-      {
-        if (!node->is_begin_event || node->whole_group_in_dag)
-        {
-          good_to_break= false;
-          break;
-        }
-      }
-      rli->dag_unlock();
-      if (good_to_break) break;
+      rli->clear_dep(false);
+    }
+    mysql_mutex_unlock(&rli->dep_lock);
+    wait_for_dep_workers_to_finish(rli, partial);
+    // case: if UNTIL is specified let's clear after waiting for workers
+    if (unlikely(rli->until_condition != Relay_log_info::UNTIL_NONE))
+    {
+      rli->clear_dep(true);
     }
 
-    // set all workers as STOP_ACCEPTED
+    // set all workers as STOP_ACCEPTED, and signal blocked workers
     for (i= rli->workers.elements - 1; i >= 0; i--)
     {
-      Slave_worker *w;
+      Slave_worker *w= NULL;
       get_dynamic((DYNAMIC_ARRAY*)&rli->workers, (uchar*) &w, i);
       mysql_mutex_lock(&w->jobs_lock);
       if (w->running_status != Slave_worker::RUNNING)
@@ -6458,12 +6429,34 @@ void slave_stop_workers(Relay_log_info *rli, bool *mts_inited)
         continue;
       }
       w->running_status= Slave_worker::STOP_ACCEPTED;
+
+      // unblock workers waiting for new events or trxs
+      mysql_mutex_lock(&w->info_thd->LOCK_thd_data);
+      w->info_thd->awake(w->info_thd->killed);
+      mysql_mutex_unlock(&w->info_thd->LOCK_thd_data);
+
       mysql_mutex_unlock(&w->jobs_lock);
     }
-    // signal threads waiting for events
-    mysql_mutex_lock(&rli->dag_group_ready_mutex);
-    mysql_cond_broadcast(&rli->dag_group_ready_cond);
-    mysql_mutex_unlock(&rli->dag_group_ready_mutex);
+
+    thd_proc_info(thd, "Waiting for workers to exit");
+
+    for (i= rli->workers.elements - 1; i >= 0; i--)
+    {
+      Slave_worker *w= NULL;
+      get_dynamic((DYNAMIC_ARRAY*)&rli->workers, (uchar*) &w, i);
+      mysql_mutex_lock(&w->jobs_lock);
+
+      // wait for workers to stop running
+      while (w->running_status != Slave_worker::NOT_RUNNING)
+      {
+        struct timespec abstime;
+        set_timespec(abstime, 1);
+        mysql_cond_timedwait(&w->jobs_cond, &w->jobs_lock, &abstime);
+      }
+
+      mysql_mutex_unlock(&w->jobs_lock);
+    }
+    rli->dependency_worker_error= false;
   }
   else
   {
@@ -6490,30 +6483,30 @@ void slave_stop_workers(Relay_log_info *rli, bool *mts_inited)
         sql_print_information("Notifying Worker %lu to exit, thd %p", w->id,
                               w->info_thd);
     }
-  }
 
-  thd_proc_info(thd, "Waiting for workers to exit");
+    thd_proc_info(thd, "Waiting for workers to exit");
 
-  for (i= rli->workers.elements - 1; i >= 0; i--)
-  {
-    Slave_worker *w= NULL;
-    get_dynamic((DYNAMIC_ARRAY*)&rli->workers, (uchar*) &w, i);
-
-    mysql_mutex_lock(&w->jobs_lock);
-    while (w->running_status != Slave_worker::NOT_RUNNING)
+    for (i= rli->workers.elements - 1; i >= 0; i--)
     {
-      PSI_stage_info old_stage;
-      DBUG_ASSERT(w->running_status == Slave_worker::ERROR_LEAVING ||
-                  w->running_status == Slave_worker::STOP ||
-                  w->running_status == Slave_worker::STOP_ACCEPTED);
+      Slave_worker *w= NULL;
+      get_dynamic((DYNAMIC_ARRAY*)&rli->workers, (uchar*) &w, i);
 
-      thd->ENTER_COND(&w->jobs_cond, &w->jobs_lock,
-                      &stage_slave_waiting_workers_to_exit, &old_stage);
-      mysql_cond_wait(&w->jobs_cond, &w->jobs_lock);
-      thd->EXIT_COND(&old_stage);
       mysql_mutex_lock(&w->jobs_lock);
+      while (w->running_status != Slave_worker::NOT_RUNNING)
+      {
+        PSI_stage_info old_stage;
+        DBUG_ASSERT(w->running_status == Slave_worker::ERROR_LEAVING ||
+                    w->running_status == Slave_worker::STOP ||
+                    w->running_status == Slave_worker::STOP_ACCEPTED);
+
+        thd->ENTER_COND(&w->jobs_cond, &w->jobs_lock,
+                        &stage_slave_waiting_workers_to_exit, &old_stage);
+        mysql_cond_wait(&w->jobs_cond, &w->jobs_lock);
+        thd->EXIT_COND(&old_stage);
+        mysql_mutex_lock(&w->jobs_lock);
+      }
+      mysql_mutex_unlock(&w->jobs_lock);
     }
-    mysql_mutex_unlock(&w->jobs_lock);
   }
 
   if (thd->killed == THD::NOT_KILLED)
@@ -6604,6 +6597,15 @@ pthread_handler_t handle_slave_sql(void *arg)
   mysql_mutex_lock(&rli->info_thd_lock);
   rli->info_thd= thd;
   mysql_mutex_unlock(&rli->info_thd_lock);
+
+  if (opt_mts_dependency_replication &&
+      !slave_use_idempotent_for_recovery_options)
+  {
+    sql_print_error("mts_dependency_replication is enabled but "
+        "slave_use_idempotent_for_recovery is disabled. The slave is not crash "
+        "safe! Please enable slave_use_idempotent_for_recovery for crash "
+        "safety.");
+  }
 
   rli->info_thd->variables.tx_isolation=
     static_cast<enum_tx_isolation>(slave_tx_isolation);
@@ -6939,7 +6941,6 @@ llstr(rli->get_group_master_log_pos(), llbuff));
   */
   thd->clear_error();
   rli->cleanup_context(thd, 1);
-  if (opt_mts_dependency_replication) rli->clear_dag();
   /*
     Some extra safety, which should not been needed (normally, event deletion
     should already have done these assignments (each event which sets these
@@ -6948,6 +6949,8 @@ llstr(rli->get_group_master_log_pos(), llbuff));
   thd->catalog= 0;
   thd->reset_query();
   thd->reset_db(NULL, 0);
+
+  DBUG_ASSERT(rli->num_workers_waiting == 0 && rli->num_in_flight_trx == 0);
 
   THD_STAGE_INFO(thd, stage_waiting_for_slave_mutex_on_exit);
   mysql_mutex_lock(&rli->run_lock);

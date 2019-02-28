@@ -18,7 +18,9 @@
 #define SRV_SESSION_H
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
+#include "hh_wheel_timer.h"
 #include "sql_class.h"
 #include "violite.h"             /* enum_vio_type */
 
@@ -34,8 +36,10 @@
 extern PSI_statement_info stmt_info_new_packet;
 #endif
 
+extern ulong thd_get_net_wait_timeout(const THD* thd);
 
-class Srv_session
+class Srv_session : public HHWheelTimer::Callback,
+                    public std::enable_shared_from_this<Srv_session>
 {
 public:
 
@@ -66,12 +70,17 @@ public:
   */
   static bool module_deinit();
 
-  static std::shared_ptr<Srv_session> find_session(const std::string& key);
-  static std::shared_ptr<Srv_session> find_session(my_thread_id session_id);
+  static my_thread_id parse_session_key(const std::string& key);
+  static std::shared_ptr<Srv_session> access_session(my_thread_id session_id);
   static void remove_session(my_thread_id session_id);
+  static void remove_session_if_ids_match(const Srv_session& session,
+                                          HHWheelTimer::ID id);
   static bool store_session(std::shared_ptr<Srv_session> session);
 
   static std::vector<std::shared_ptr<Srv_session>> get_sorted_sessions();
+
+  static std::pair<bool, std::chrono::milliseconds> session_timed_out(
+      my_thread_id session_id);
 
   /* Non-static members follow */
 
@@ -112,11 +121,13 @@ public:
   /**
     Opens a server session
 
+    @param[in]  the connection THD to get defaults from
+
     @return
       session  on success
       NULL     on failure
   */
-  bool open();
+  bool open(const THD* conn_thd);
 
   /**
     Attaches the session to the current physical thread
@@ -146,24 +157,10 @@ public:
   bool close();
 
   /**
-    Executes a query.
-
-    @param packet     Pointer to beginning of query in packet
-    @param length     Query length
-    @param client_cs  The charset for the string data input (COM_QUERY
-                      for example)
-
-    @returns
-      1   error
-      0   success
-  */
-  int execute_query(char* packet, uint packet_length,
-                      const CHARSET_INFO * client_cs);
-
-  /**
     Returns the internal THD object
   */
   inline THD* get_thd() { return &thd_; }
+  inline const THD* get_thd() const { return &thd_; }
 
   /**
     Returns the ID of a session.
@@ -190,11 +187,6 @@ public:
 
   uint32_t get_conn_thd_id() { return conn_thd_id.load(); }
 
-  void set_session_tracker(Session_tracker* tracker)
-  {
-    session_tracker_ = tracker;
-  }
-
   /*
    * Function called before sending out the Ok/Err.
    * It will remove session from map if there was no session state changed or
@@ -213,6 +205,19 @@ public:
   void set_host_or_ip(const char* str) { host_or_ip = str; }
   const std::string& get_host_or_ip() { return host_or_ip; }
 
+  // Enable the wait timeout for this detached session
+  void enableWaitTimeout() {
+    auto timeout = std::chrono::seconds(thd_get_net_wait_timeout(get_thd()));
+    callbackId_ = hhWheelTimer->scheduleTimeout(shared_from_this(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(timeout));
+  }
+
+  // Disable the wait timeout
+  void disableWaitTimeout() {
+    hhWheelTimer->cancelTimeout(shared_from_this());
+    callbackId_ = 0;
+  }
+
 private:
   void switch_state_safe(srv_session_state state);
 
@@ -222,6 +227,23 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
     return state_;
   }
+
+  // Handle the timeout expired.
+  void timeoutExpired(HHWheelTimer::ID id) noexcept override {
+    // Remove this session from the list if the id we just got matches the id
+    // stored in the session (which was set when the session was detached).
+    // We want to do this under a lock for thread safety, so the check is
+    // passed in as a predicate function.
+    Srv_session::remove_session_if_ids_match(*this, id);
+    // TODO (jkedgar) add this session's ID into a map so we can detect that
+    // it timed out.
+  }
+
+  // We don't need to know that the timer was cancelled
+  void timeoutCancelled(HHWheelTimer::ID /*id*/) noexcept override {}
+
+  // ID of the last scheduled callback
+  HHWheelTimer::ID callbackId_;
 
   /**
     Changes the state of a session to detached
@@ -238,11 +260,12 @@ private:
 
   // Store the default vio and stmt_da fields to use when detaching the session
   Vio* default_vio_to_restore_ = NULL;
-  Diagnostics_area * default_stmt_to_restore_ = NULL;
-  Session_tracker *session_tracker_ = NULL;
 
   // Connection THD ID.
   std::atomic_uint conn_thd_id;
+
+  // Set to true once a session has been detached
+  bool has_been_detached_ = false;
 
   // Used to provide exclusion: a session can be attached to only one
   // connection thread at one time.

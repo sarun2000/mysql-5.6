@@ -67,6 +67,8 @@
 using std::max;
 using std::min;
 
+#include "query_tag_perf_counter.h"
+
 #define STR_OR_NIL(S) ((S) ? (S) : "<nil>")
 
 #ifdef WITH_PARTITION_STORAGE_ENGINE
@@ -262,6 +264,7 @@ struct show_privileges_st {
 
 static struct show_privileges_st sys_privileges[]=
 {
+  {"Admin port", "Server Admin", "To use the admin port which bypasses connection limits"},
   {"Alter", "Tables",  "To alter the table"},
   {"Alter routine", "Functions,Procedures",  "To alter or drop stored functions/procedures"},
   {"Create", "Databases,Tables,Indexes",  "To create new databases and tables"},
@@ -1064,7 +1067,8 @@ bool mysqld_show_create_db(THD *thd, char *dbname,
       enclose_comment = true;
     }
     buffer.append(STRING_WITH_LEN(" DB_METADATA "));
-    buffer.append(create.db_metadata.ptr());
+    append_unescaped(&buffer, create.db_metadata.ptr(),
+                     create.db_metadata.length());
   }
 
   if (enclose_comment)
@@ -3592,6 +3596,17 @@ static bool show_status_array(THD *thd, const char *wild,
   len=name_buffer + sizeof(name_buffer) - prefix_end;
   partial_cond= make_cond_for_info_schema(cond, table->pos_in_table_list);
 
+  // Find the length of the user's 'LIKE' parameter until the first wildcard
+  ulonglong before_wild_len= 0;
+  while (wild &&
+         wild[before_wild_len] != wild_one &&
+         wild[before_wild_len] != wild_many &&
+         wild[before_wild_len] != wild_prefix &&
+         wild[before_wild_len])
+  {
+    ++before_wild_len;
+  }
+
   for (; variables->name; variables++)
   {
     strnmov(prefix_end, variables->name, len);
@@ -3599,14 +3614,25 @@ static bool show_status_array(THD *thd, const char *wild,
     if (ucase_names)
       make_upper(name_buffer);
 
+    const auto len= strlen(name_buffer);
     restore_record(table, s->default_values);
-    table->field[0]->store(name_buffer, strlen(name_buffer),
+    table->field[0]->store(name_buffer, len,
                            system_charset_info);
+
+    bool prefix_matches= true;
+    if (variables->type == SHOW_FUNC && before_wild_len > 0)
+    {
+      const auto min_len= before_wild_len < len ? before_wild_len : len;
+      prefix_matches= my_strnncoll(system_charset_info,
+                                   (const uchar*) name_buffer, min_len,
+                                   (const uchar*) wild, min_len) == 0;
+    }
+
     /*
       if var->type is SHOW_FUNC, call the function.
       Repeat as necessary, if new var is again SHOW_FUNC
     */
-    for (var=variables; var->type == SHOW_FUNC; var= &tmp)
+    for (var=variables; prefix_matches && var->type == SHOW_FUNC; var= &tmp)
       ((mysql_show_var_func)(var->value))(thd, &tmp, buff);
 
     SHOW_TYPE show_type=var->type;
@@ -5305,14 +5331,29 @@ err:
 }
 
 
-bool store_schema_shemata(THD* thd, TABLE *table, LEX_STRING *db_name,
-                          const CHARSET_INFO *cs)
+bool store_schema_schemata(THD* thd, TABLE *table, LEX_STRING *db_name,
+                           HA_CREATE_INFO *info)
 {
   restore_record(table, s->default_values);
   table->field[0]->store(STRING_WITH_LEN("def"), system_charset_info);
   table->field[1]->store(db_name->str, db_name->length, system_charset_info);
+  const CHARSET_INFO *cs =
+    (info != NULL) ? info->default_table_charset : system_charset_info;
   table->field[2]->store(cs->csname, strlen(cs->csname), system_charset_info);
   table->field[3]->store(cs->name, strlen(cs->name), system_charset_info);
+  return schema_table_store_record(thd, table);
+}
+
+bool store_schema_schemata_ext(THD* thd, TABLE *table, LEX_STRING *db_name,
+                              HA_CREATE_INFO *info)
+{
+  restore_record(table, s->default_values);
+  table->field[0]->store(STRING_WITH_LEN("def"), system_charset_info);
+  table->field[1]->store(db_name->str, db_name->length, system_charset_info);
+  if (info)
+    table->field[2]->store(info->db_metadata.c_ptr(),
+                           info->db_metadata.length(),
+                           system_charset_info);
   return schema_table_store_record(thd, table);
 }
 
@@ -5378,8 +5419,12 @@ int fetch_schema_schemata(THD *thd)
   DBUG_RETURN(0);
 }
 
+typedef bool (*store_schema_schemata_callback)(THD *thd, TABLE *table,
+                                               LEX_STRING *db_name,
+                                               HA_CREATE_INFO *create);
 
-int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
+int fill_schema_schemata_impl(THD *thd, TABLE_LIST *tables, Item *cond,
+                              store_schema_schemata_callback callback)
 {
   /*
     TODO: fill_schema_schemata() is called when new client is connected.
@@ -5416,7 +5461,7 @@ int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
   Security_context *sctx= thd->security_ctx;
 #endif
-  DBUG_ENTER("fill_schema_schemata");
+  DBUG_ENTER("fill_schema_schemata_impl");
 
   if (get_lookup_field_values(thd, cond, tables, &lookup_field_vals))
     DBUG_RETURN(0);
@@ -5452,8 +5497,7 @@ int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
     DBUG_ASSERT(db_name->length <= NAME_LEN);
     if (with_i_schema)       // information schema name is always first in list
     {
-      if (store_schema_shemata(thd, table, db_name,
-                               system_charset_info))
+      if (callback(thd, table, db_name, NULL))
         DBUG_RETURN(1);
       with_i_schema= 0;
       continue;
@@ -5465,13 +5509,23 @@ int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
 	!check_grant_db(thd, db_name->str))
 #endif
     {
-      load_db_opt_by_name(thd, db_name->str, &create);
-      if (store_schema_shemata(thd, table, db_name,
-                               create.default_table_charset))
+      load_db_opt_by_name(thd, db_name->str, &create, true);
+      if (callback(thd, table, db_name, &create))
         DBUG_RETURN(1);
     }
   }
   DBUG_RETURN(0);
+}
+
+int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
+{
+  return fill_schema_schemata_impl(thd, tables, cond, store_schema_schemata);
+}
+
+int fill_schema_schemata_ext(THD *thd, TABLE_LIST *tables, Item *cond)
+{
+  return fill_schema_schemata_impl(thd, tables, cond,
+                                   store_schema_schemata_ext);
 }
 
 
@@ -8696,6 +8750,16 @@ ST_FIELD_INFO schema_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE}
 };
 
+ST_FIELD_INFO schema_ext_fields_info[]=
+{
+  {"CATALOG_NAME", FN_REFLEN, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE},
+  {"SCHEMA_NAME", NAME_CHAR_LEN, MYSQL_TYPE_STRING, 0, 0, "Database",
+   SKIP_OPEN_TABLE},
+  {"DB_METADATA", DB_METADATA_MAX_LENGTH, MYSQL_TYPE_STRING, 0, 0, 0,
+   SKIP_OPEN_TABLE},
+  {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE}
+};
+
 
 ST_FIELD_INFO tables_fields_info[]=
 {
@@ -9522,6 +9586,9 @@ ST_SCHEMA_TABLE schema_tables[]=
   {"QUERY_ATTRIBUTES", query_attrs_fields_info,
    create_schema_table, fill_schema_query_attrs,
    NULL, NULL, -1, -1, false, 0},
+  {"QUERY_PERF_COUNTER", qutils::query_tag_perf_fields_info,
+    create_schema_table, qutils::fill_query_tag_perf_counter,
+    NULL, NULL, -1, -1, false, 0},
   {"PROFILING", query_profile_statistics_info, create_schema_table,
     fill_query_profile_statistics_info, make_profile_table_for_show, 
     NULL, -1, -1, false, 0},
@@ -9585,6 +9652,8 @@ ST_SCHEMA_TABLE schema_tables[]=
   {"SLAVE_DB_LOAD", slave_db_load_fields_info, create_schema_table,
    fill_slave_db_load, 0, 0, -1, -1, 0, 0},
 #endif
+  {"SCHEMATA_EXT", schema_ext_fields_info, create_schema_table,
+   fill_schema_schemata_ext, NULL, 0, 1, -1, 0, 0},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 };
 

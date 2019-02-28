@@ -164,15 +164,16 @@ public:
     Searches for an element with in the map
 
     @param key Key of the element
+    @param fcn Function to call while still holding the lock
 
     @return
       value of the element
       NULL  if not found
   */
-  map_value_t find(const map_key_t& key)
+  map_value_t find(const map_key_t& key, std::function<void(Srv_session&)> fcn)
   {
     if (!initted.load()) // if map already destroyed
-      return NULL;
+      return nullptr;
 
     Auto_rw_lock_read lock(&LOCK_collection);
 
@@ -180,7 +181,11 @@ public:
     if (it == collection.end()) {
       return nullptr;
     }
-    return it->second;
+
+    map_value_t& session = it->second;
+    fcn(*session);
+
+    return session;
   }
 
   /**
@@ -241,6 +246,34 @@ public:
   }
 
   /**
+    Removes an element from the map if the predicate function returns true
+
+    @param key:  key
+    @param pred: predicate function
+
+  */
+  bool remove_if(const map_key_t& key, std::function<bool(map_value_t&)> pred) {
+    if (!initted.load()) // if map already destroyed
+      return false;
+
+    Auto_rw_lock_write lock(&LOCK_collection);
+    /*
+      If we use erase with the key directly an exception could be thrown. The
+      find method never throws. erase() with iterator as parameter also never
+      throws.
+    */
+    auto it= collection.find(key);
+    if (it != collection.end() && pred(it->second))
+    {
+      DBUG_PRINT("info", ("Removed srv session from map %d", key));
+      collection.erase(it);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
     Empties the map
   */
   void deinit()
@@ -276,7 +309,7 @@ public:
       }
     }
     std::sort(session_list.begin(), session_list.end(),
-        [](map_value_t s1, map_value_t s2) {
+        [](const map_value_t& s1, const map_value_t& s2) {
         return s1->get_session_id() < s2->get_session_id();
       });
     return session_list;
@@ -285,35 +318,220 @@ public:
 
 static Mutexed_map_thd_srv_session server_session_list;
 
-std::shared_ptr<Srv_session> Srv_session::find_session(
-    const std::string& string_key) {
-  char *endptr = 0;
-  const char* string_key_cstr = string_key.c_str();
+static void prune_timed_out_sessions(my_timer_t *timer);
 
+class Mutexed_timed_out_session_collection
+{
+private:
+  typedef my_thread_id Key;
+  typedef std::chrono::milliseconds Value;
+
+  static constexpr unsigned long kPruneTimeoutMs = 1000; // in milliseconds
+
+  std::unordered_map<Key, Value> collection;
+  std::map<std::chrono::steady_clock::time_point, std::vector<Key>> expirations;
+
+  std::atomic_bool initted;
+
+  my_timer_t timer_;
+
+  mutable mysql_rwlock_t LOCK_collection;
+
+#ifdef HAVE_PSI_INTERFACE
+  PSI_rwlock_key key_LOCK_collection;
+#endif
+
+  // Prune old data out of the collection of sessions that have timed out.
+  // This is done by repeatedly checking the first entry in the expiration
+  // map.  As long as one exists and the timeout on it has expired, remove
+  // it from the collection.
+  void prune_safe(std::chrono::steady_clock::time_point expire)
+  {
+    auto it = expirations.cbegin();
+    while (it != expirations.cend() && it->first <= expire) {
+      for (const auto& key : it->second) {
+        collection.erase(key);
+      }
+
+      it = expirations.erase(it);
+    }
+  }
+
+public:
+  // Initializes the set
+  void init()
+  {
+#ifdef HAVE_PSI_INTERFACE
+    PSI_rwlock_info all_rwlocks[]=
+    {
+      { &key_LOCK_collection, "LOCK_timed_out_session_set", PSI_FLAG_GLOBAL}
+    };
+
+    mysql_rwlock_register("timed out sessions", all_rwlocks,
+            array_elements(all_rwlocks));
+#endif
+    mysql_rwlock_init(key_LOCK_collection, &LOCK_collection);
+
+    timer_.id = 0;
+    initted = true;
+  }
+
+  // Empties the set
+  void deinit()
+  {
+    initted = false;
+
+    if (started()) {
+      Auto_rw_lock_read lock(&LOCK_collection);
+      int state;
+      my_timer_cancel(&timer_, &state); // ignore state
+      my_timer_delete(&timer_);
+    }
+
+    collection.clear();
+    expirations.clear();
+
+    mysql_rwlock_destroy(&LOCK_collection);
+  }
+
+  void start()
+  {
+    int ret = my_timer_create(&timer_);
+    if (ret) {
+      // NO_LINT_DEBUG
+      sql_print_warning(
+          "Unable to create timer for the session timed out list");
+    } else {
+      timer_.notify_function = prune_timed_out_sessions;
+      ret = my_timer_set(&timer_, kPruneTimeoutMs);
+      if (ret) {
+        // NO_LINT_DEBUG
+        sql_print_warning("Unable to set timer for the session timed out list");
+      }
+    }
+  }
+
+  bool started()
+  {
+    return timer_.id != 0;
+  }
+
+  std::pair<bool, Value> access(const Key& key) const {
+    if (!initted) // if map already destroyed
+    {
+      return std::make_pair(false, std::chrono::milliseconds(0));
+    }
+
+    Auto_rw_lock_read lock(&LOCK_collection);
+    auto it = collection.find(key);
+    if (it == collection.end()) {
+      return std::make_pair(false, std::chrono::milliseconds(0));
+    }
+
+    return std::make_pair(true, it->second);
+  }
+
+  void insert(
+      const Key& key,
+      std::chrono::milliseconds idle_timeout,
+      std::chrono::seconds expiration) {
+    if (!initted) // if map already destroyed
+    {
+      return;
+    }
+
+    Auto_rw_lock_write lock(&LOCK_collection);
+
+    if (!started())
+    {
+      start();
+    }
+
+    collection[key] = idle_timeout;
+
+    auto expire = std::chrono::steady_clock::now() + expiration;
+    expirations[expire].push_back(key);
+  }
+
+  // Check to see if we need to prune any data from the expired RPC_ID
+  // collection
+  void prune() noexcept
+  {
+    if (!initted) // if map already destroyed
+    {
+      return;
+    }
+
+    Auto_rw_lock_write lock(&LOCK_collection);
+    prune_safe(std::chrono::steady_clock::now());
+
+    if (my_timer_set(&timer_, kPruneTimeoutMs)) {
+      my_timer_delete(&timer_);
+      timer_.id = 0;
+      // NO_LINT_DEBUG
+      sql_print_warning("Unable to reset timer for the session timed out list");
+    }
+  }
+};
+
+
+constexpr unsigned long Mutexed_timed_out_session_collection::kPruneTimeoutMs;
+
+static Mutexed_timed_out_session_collection timed_out_session_list;
+
+void prune_timed_out_sessions(my_timer_t * /*timer*/) {
+  timed_out_session_list.prune();
+}
+
+my_thread_id Srv_session::parse_session_key(const std::string& string_key) {
   if (string_key.size() > MAX_INT_WIDTH) {
-    DBUG_PRINT("error", ("Wrong format for rpc_id '%s'", string_key_cstr));
-    return nullptr;
+    return (my_thread_id) -1;
   }
 
   errno = 0;    /* To distinguish success/failure after call */
-  long int session_id = strtol(string_key_cstr, &endptr, 10);
+  char* endptr = nullptr;
+  auto session_id = strtol(string_key.c_str(), &endptr, 10);
 
   /* Check for various possible errors */
-  if (errno != 0 || endptr == 0 || *endptr != '\0' || session_id <= 0) {
-    DBUG_PRINT("error", ("Wrong format for rpc_id '%s'", string_key_cstr));
-    return nullptr;
+  if (errno != 0 || endptr == nullptr || *endptr != '\0' || session_id <= 0) {
+    return (my_thread_id) -1;
   }
 
-  return find_session(session_id);
+  return session_id;
 }
 
-std::shared_ptr<Srv_session> Srv_session::find_session(
+// Find the detached session and disable the wait timeout.
+std::shared_ptr<Srv_session> Srv_session::access_session(
     my_thread_id session_id) {
-  return server_session_list.find(session_id);
+  // Attempt to find the session by session ID in the detached session list.
+  // On success disable the wait timeout while still holding the lock to
+  // avoid race conditions.
+  return server_session_list.find(session_id,
+      [](Srv_session& session) {
+          session.disableWaitTimeout();
+      });
 }
 
 void Srv_session::remove_session(my_thread_id session_id) {
   server_session_list.remove(session_id);
+}
+
+constexpr ulong kIdleTimeoutMultiplier = 2;
+void Srv_session::remove_session_if_ids_match(
+    const Srv_session& session, HHWheelTimer::ID id) {
+  auto session_id = session.get_session_id();
+  auto res = server_session_list.remove_if(
+      session_id,
+      [id](std::shared_ptr<Srv_session>& session) {
+          return session->callbackId_ == id;
+      });
+  if (res) {
+    auto wait_timeout = thd_get_net_wait_timeout(session.get_thd()); // seconds
+    timed_out_session_list.insert(
+        session_id,
+        std::chrono::milliseconds(wait_timeout * 1000),
+        std::chrono::seconds(kIdleTimeoutMultiplier * wait_timeout));
+  }
 }
 
 bool Srv_session::store_session(std::shared_ptr<Srv_session> session) {
@@ -323,6 +541,11 @@ bool Srv_session::store_session(std::shared_ptr<Srv_session> session) {
 std::vector<std::shared_ptr<Srv_session>> Srv_session::get_sorted_sessions() {
   DBUG_PRINT("info", ("sessions list size %d", server_session_list.size()));
   return server_session_list.get_sorted_srv_session_list();
+}
+
+std::pair<bool, std::chrono::milliseconds> Srv_session::session_timed_out(
+    my_thread_id session_id) {
+  return timed_out_session_list.access(session_id);
 }
 
 /**
@@ -353,6 +576,7 @@ bool Srv_session::module_init()
   srv_session_THRs_initialized= true;
 
   server_session_list.init();
+  timed_out_session_list.init();
 
   return false;
 }
@@ -371,6 +595,7 @@ bool Srv_session::module_deinit()
   DBUG_ENTER("Srv_session::module_deinit");
   if (srv_session_THRs_initialized)
   {
+    timed_out_session_list.deinit();
     server_session_list.deinit();
 
     srv_session_THRs_initialized= false;
@@ -393,7 +618,6 @@ Srv_session::Srv_session() : state_(SRV_SESSION_CREATED)
   thd_.net.reading_or_writing= 0;
 
   default_vio_to_restore_ = thd_.net.vio;
-  default_stmt_to_restore_ = thd_.get_stmt_da();
 }
 
 
@@ -405,7 +629,7 @@ Srv_session::Srv_session() : state_(SRV_SESSION_CREATED)
     true   on failure
 */
 
-bool Srv_session::open()
+bool Srv_session::open(const THD* conn_thd)
 {
   DBUG_ENTER("Srv_session::open");
 
@@ -421,11 +645,8 @@ bool Srv_session::open()
     No store_globals() here as the session is always created in a detached
     state. Attachment with store_globals() will happen on demand.
   */
-  if (thd_init_client_charset(get_thd(), my_charset_utf8_general_ci.number))
-  {
-    connection_errors_internal++;
-    DBUG_RETURN(true);
-  }
+  thd_.copy_client_charset_settings(conn_thd);
+  thd_.client_capabilities = conn_thd->client_capabilities;
 
   thd_.update_charset();
 
@@ -555,6 +776,10 @@ bool Srv_session::attach()
     DBUG_RETURN(true);
   }
 
+  if (old_thd) {
+    thd_.set_stmt_da(old_thd->get_stmt_da());
+  }
+
   DBUG_PRINT("info",("current_thd=%p", current_thd));
 
   thd_clear_errors(&thd_);
@@ -593,7 +818,7 @@ bool Srv_session::detach()
 
   // restore fields
   thd_.protocol = &thd_.protocol_text;
-  thd_.set_stmt_da(default_stmt_to_restore_);
+  thd_.reset_stmt_da();
   thd_.net.vio = default_vio_to_restore_;
 
   thd_.restore_globals();
@@ -665,7 +890,9 @@ bool Srv_session::close()
   THD *old_thd= current_thd;
 
   // attach session to thread
-  attach();
+  if (attach()) {
+    DBUG_RETURN(TRUE);
+  }
 
   DBUG_ASSERT(get_state() < SRV_SESSION_CLOSED);
 
@@ -704,31 +931,6 @@ void Srv_session::set_detached()
   thd_set_thread_stack(&thd_, NULL);
 }
 
-int Srv_session::execute_query(char* packet, uint packet_length,
-                                 const CHARSET_INFO * client_cs)
-{
-  DBUG_ENTER("Srv_session::execute_query");
-
-  if (client_cs &&
-      thd_.variables.character_set_results != client_cs &&
-      thd_init_client_charset(&thd_, client_cs->number))
-    DBUG_RETURN(1);
-
-  mysql_audit_release(&thd_);
-
-  DBUG_ASSERT(thd_.m_statement_psi == NULL);
-  thd_.m_statement_psi= MYSQL_START_STATEMENT(&thd_.m_statement_state,
-                                             stmt_info_new_packet.m_key,
-                                             thd_.db,
-                                             thd_.db_length,
-                                             thd_.charset());
-
-  int ret = dispatch_command(COM_QUERY, &thd_, packet, packet_length, this);
-
-  DBUG_RETURN(ret);
-}
-
-
 static void append_session_id_in_ok(THD* session_thd) {
   session_thd->get_stmt_da()->set_message("%s:%d",
             Srv_session::RpcIdAttr, session_thd->thread_id());
@@ -745,17 +947,21 @@ static void append_session_id_in_ok(THD* session_thd) {
 void Srv_session::end_statement() {
   DBUG_ENTER(__func__);
 
-  static LEX_CSTRING key = { STRING_WITH_LEN(RpcIdAttr) };
+  static LEX_CSTRING key = { STRING_WITH_LEN("rpc_id") };
 
   if (!session_state_changed()) {
-    // remove from session map
-    server_session_list.remove(get_session_id());
+    if (!has_been_detached_) {
+      // remove from session map if no state has ever changed
+      server_session_list.remove(get_session_id());
+    }
+
     DBUG_VOID_RETURN;
   }
 
   if (!thd_.is_error()) {
     append_session_id_in_ok(&thd_);
-    auto tracker = session_tracker_->get_tracker(SESSION_RESP_ATTR_TRACKER);
+    auto tracker =
+        get_thd()->session_tracker.get_tracker(SESSION_RESP_ATTR_TRACKER);
     if (tracker->is_enabled())
     {
       char tmp[21];
@@ -764,6 +970,8 @@ void Srv_session::end_statement() {
       tracker->mark_as_changed(current_thd, &key, &value);
     }
   }
+
+  has_been_detached_ = true;
 
   // Mark that session will be detached after finishing sending response out
   // so if next in session query comes on another connection thread it can wait

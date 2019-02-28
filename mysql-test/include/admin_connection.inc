@@ -22,12 +22,22 @@ grant all privileges on *.* to 'super2'@'localhost' identified by password '' wi
 flush user_resources;
 
 select user from mysql.user order by 1 asc;
+select ERRORS_TOTAL,CONNECTIONS_CONCURRENT,CONNECTIONS_DENIED_MAX_USER,CONNECTIONS_DENIED_MAX_GLOBAL from information_schema.USER_STATISTICS where USER_NAME like 'nosuper';
 
 --echo ## Start a connection fail_admin_con1 at ADMIN_PORT with new user nosuper
 --echo ## This will fail since this user doesn't have SUPER ACL
 --replace_result $MASTER_MYSOCK MASTER_SOCKET $ADMIN_PORT ADMIN_PORT
 --error ER_SPECIFIC_ACCESS_DENIED_ERROR
 connect (fail_admin_con1,$IP,nosuper,,mysql,$admin_port);
+
+select ERRORS_TOTAL,CONNECTIONS_CONCURRENT,CONNECTIONS_DENIED_MAX_USER,CONNECTIONS_DENIED_MAX_GLOBAL from information_schema.USER_STATISTICS where USER_NAME like 'nosuper';
+
+--echo ## Grant the admin port privilege to nosuper and check a second time if
+--echo ## the user can now successfully connect to the admin port
+grant admin port on *.* to 'nosuper'@'localhost' identified by password '';
+flush privileges;
+connect (success_admin_con2,$IP,nosuper,,,$admin_port);
+disconnect success_admin_con2;
 
 --echo ## Start connections admin_con_root1,2,3 at ADMIN_PORT
 --echo ## This will succeed since root has SUPER ACL
@@ -119,6 +129,11 @@ show processlist;
 --echo ## Switch to non_admin_con_super1_1
 connection non_admin_con_super1_1;
 select user from mysql.user order by 1 asc;
+
+--echo ## The non-super user should be able to bypass the connection limit as
+--echo ## well when using the admin port
+connect (admin_nonsuper_conn, $IP,nosuper,,,$admin_port);
+disconnect admin_nonsuper_conn;
 
 let $i=4;
 while ($i<=8) {

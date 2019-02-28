@@ -250,6 +250,12 @@ enum enum_alter_inplace_result {
 */
 #define HA_BLOCK_CONST_TABLE          (LL(1) << 42)
 
+/*
+  There is no need to evict the table from the table definition cache having
+  run ANALYZE TABLE on it
+ */
+#define HA_ONLINE_ANALYZE             (LL(1) << 43)
+
 /* bits in index_flags(index_number) for what you can do with index */
 #define HA_READ_NEXT            1       /* TODO really use this flag */
 #define HA_READ_PREV            2       /* supports ::index_prev */
@@ -373,6 +379,10 @@ static const uint MYSQL_START_TRANS_OPT_READ_ONLY                 = 2;
 static const uint MYSQL_START_TRANS_OPT_READ_WRITE                = 4;
 // WITH CONSISTENT INNODB|ROCKSDB SNAPSHOT option
 static const uint MYSQL_START_TRANS_OPT_WITH_CONS_ENGINE_SNAPSHOT = 8;
+// WITH SHARED INNODB|ROCKSDB SNAPSHOT option
+static const uint MYSQL_START_TRANS_OPT_WITH_SHAR_ENGINE_SNAPSHOT = 16;
+// WITH EXISTING INNODB|ROCKSDB SNAPSHOT option
+static const uint MYSQL_START_TRANS_OPT_WITH_EXIS_ENGINE_SNAPSHOT = 32;
 
 /* Flags for method is_fatal_error */
 #define HA_CHECK_DUP_KEY 1
@@ -710,6 +720,7 @@ enum enum_schema_tables
   SCH_TRANSACTION_LIST,
   SCH_CONNECTION_ATTRIBUTES,
   SCH_QUERY_ATTRIBUTES,
+  SCH_QUERY_PERF_COUNTER,
   SCH_PROFILES,
   SCH_REFERENTIAL_CONSTRAINTS,
   SCH_PROCEDURES,
@@ -816,6 +827,37 @@ struct handler_iterator {
   void *buffer;
 };
 
+enum snapshot_operation
+{
+  SNAPSHOT_CREATE,
+  SNAPSHOT_ATTACH,
+  SNAPSHOT_RELEASE,
+  SNAPSHOT_NONE
+};
+
+struct snapshot_info_st
+{
+  std::string binlog_file;
+  ulonglong binlog_pos= 0;
+  std::string gtid_executed;
+  ulonglong snapshot_id= 0;
+  enum snapshot_operation op= snapshot_operation::SNAPSHOT_NONE;
+};
+
+class explicit_snapshot
+{
+protected:
+  virtual ~explicit_snapshot()
+  {
+  }
+
+public:
+  snapshot_info_st ss_info;
+  explicit_snapshot(snapshot_info_st ss_info) : ss_info(ss_info)
+  {
+  }
+};
+
 class handler;
 /*
   handlerton is a singleton structure - one instance per storage engine -
@@ -909,11 +951,12 @@ struct handlerton
    handler *(*create)(handlerton *hton, TABLE_SHARE *table, MEM_ROOT *mem_root);
    void (*drop_database)(handlerton *hton, char* path);
    int (*panic)(handlerton *hton, enum ha_panic_function flag);
+   bool (*explicit_snapshot)(handlerton *hton, THD *thd,
+                             snapshot_info_st *ss_info);
    int (*start_consistent_snapshot)(handlerton *hton, THD *thd,
-                                    char *binlog_file,
-                                    ulonglong* binlog_pos,
-                                    char **gtid_executed,
-                                    int* gtid_executed_length);
+                                    snapshot_info_st *ss_info);
+   int (*start_shared_snapshot)(handlerton *hton, THD *thd,
+                                    snapshot_info_st *ss_info);
    bool (*flush_logs)(handlerton *hton, unsigned long long target_lsn);
    bool (*show_status)(handlerton *hton, THD *thd, stat_print_fn *print, enum ha_stat_type stat);
    uint (*partition_flags)();
@@ -1088,7 +1131,7 @@ enum enum_db_read_only { DB_READ_ONLY_NO = 0,
                          DB_READ_ONLY_SUPER = 2,
                          DB_READ_ONLY_NULL = 255 };
 
-typedef struct st_ha_create_information
+struct st_ha_create_information_base
 {
   const CHARSET_INFO *table_charset, *default_table_charset;
   bool alter_default_table_charset; /* This is to differentiate whether the
@@ -1096,7 +1139,9 @@ typedef struct st_ha_create_information
                                        means it is explicitly set to default or
                                        it is not specified in alter */
   enum enum_db_read_only db_read_only;
-  String db_metadata;
+  bool alter_db_metadata;  /* This is to differentiate whether the null value
+                              for db_metadata means it is explicitly set to
+                              default or it is not specified in alter */
   LEX_STRING connect_string;
   const char *password, *tablespace;
   LEX_STRING comment;
@@ -1111,7 +1156,6 @@ typedef struct st_ha_create_information
   uint stats_sample_pages;		/* number of pages to sample during
 					stats estimation, if used, otherwise 0. */
   enum_stats_auto_recalc stats_auto_recalc;
-  SQL_I_List<TABLE_LIST> merge_list;
   handlerton *db_type;
   /**
     Row type of the table definition.
@@ -1131,9 +1175,38 @@ typedef struct st_ha_create_information
   enum ha_storage_media storage_media;  /* DEFAULT, DISK or MEMORY */
   bool rbr_column_names; /* If true, column names for this table are logged
                             in Table_map_log_events */
+};
 
-  /* initialize db_read_only parameter */
-  st_ha_create_information() : db_read_only(DB_READ_ONLY_NO) {}
+
+/**
+  WARNING: Put your new field of C++ class types (such as string) and add
+  proper reset support in reset function. Add new POD fields in the base class.
+  Otherwise you may run into memory leak or data corruption as we call memset
+  on the base while reset the individual fields explicitly.
+ */
+typedef struct st_ha_create_information : public st_ha_create_information_base
+{
+  String db_metadata;
+  SQL_I_List<TABLE_LIST> merge_list;
+
+  st_ha_create_information()
+  {
+    reset();
+  }
+
+  /* reset this structure to default state */
+  void reset()
+  {
+    // memset the base struct with POD fields
+    memset(
+      (st_ha_create_information_base *)this,
+      0,
+      sizeof(st_ha_create_information_base));
+
+    // reset the individual C++ fields case by case
+    db_metadata.free();
+    merge_list.empty();
+  }
 } HA_CREATE_INFO;
 
 /**
@@ -3690,11 +3763,12 @@ int ha_change_key_cache(KEY_CACHE *old_key_cache, KEY_CACHE *new_key_cache);
 int ha_release_temporary_latches(THD *thd);
 
 /* transactions: interface to handlerton functions */
-int ha_start_consistent_snapshot(THD *thd, char *binlog_file,
-                                 ulonglong* binlog_pos,
-                                 char **gtid_executed,
-                                 int* gtid_executed_length,
+int ha_start_consistent_snapshot(THD *thd, snapshot_info_st *ss_info,
                                  handlerton *hton);
+int ha_start_shared_snapshot(THD *thd, snapshot_info_st *ss_info,
+                             handlerton *hton);
+int ha_start_existing_snapshot(THD *thd, snapshot_info_st *ss_info,
+                               handlerton *hton);
 int ha_commit_or_rollback_by_xid(THD *thd, XID *xid, bool commit);
 int ha_commit_trans(THD *thd, bool all, bool async,
                     bool ignore_global_read_lock= false);
@@ -3708,7 +3782,7 @@ int ha_recover(HASH *commit_list, char *binlog_file = NULL,
  intended to be used by the transaction coordinators to
  commit/prepare/rollback transactions in the engines.
 */
-int ha_commit_low(THD *thd, bool all, bool async);
+int ha_commit_low(THD *thd, bool all, bool async, bool run_after_commit= true);
 int ha_prepare_low(THD *thd, bool all, bool async);
 int ha_rollback_low(THD *thd, bool all);
 
@@ -3720,6 +3794,9 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv);
 bool ha_rollback_to_savepoint_can_release_mdl(THD *thd);
 int ha_savepoint(THD *thd, SAVEPOINT *sv);
 int ha_release_savepoint(THD *thd, SAVEPOINT *sv);
+
+bool ha_explicit_snapshot(THD *thd, handlerton *hton,
+                          snapshot_info_st *ss_info);
 
 /* Build pushed joins in handlers implementing this feature */
 int ha_make_pushed_joins(THD *thd, const AQP::Join_plan* plan);

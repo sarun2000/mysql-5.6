@@ -28,7 +28,7 @@ extern char *histogram_step_size_binlog_fsync;
 extern int opt_histogram_step_size_binlog_group_commit;
 extern latency_histogram histogram_binlog_fsync;
 extern counter_histogram histogram_binlog_group_commit;
-
+extern Slow_log_throttle log_throttle_sbr_unsafe_query;
 class Relay_log_info;
 class Master_info;
 
@@ -585,6 +585,7 @@ private:
   std::pair<bool, bool> sync_binlog_file(bool force, bool async);
   void process_semisync_stage_queue(THD *queue_head);
   void process_commit_stage_queue(THD *thd, THD *queue, bool async);
+  void process_after_commit_stage_queue(THD *thd, THD *first, bool async);
   int process_flush_stage_queue(my_off_t *total_bytes_var, bool *rotate_var,
                                 THD **out_queue_var, bool async);
   int ordered_commit(THD *thd, bool all, bool skip_commit = false,
@@ -759,9 +760,8 @@ public:
   void get_current_log_without_lock_log(LOG_INFO* linfo);
   int raw_get_current_log(LOG_INFO* linfo);
   uint next_file_id();
-  void lock_commits(void);
-  void unlock_commits(char* binlog_file, ulonglong* binlog_pos,
-                      char** gtid_executed, int* gtid_executed_length);
+  void lock_commits(snapshot_info_st *ss_info);
+  void unlock_commits(const snapshot_info_st *ss_info);
   inline char* get_index_fname() { return index_file_name;}
   inline char* get_log_fname() { return log_file_name; }
   inline char* get_name() { return name; }
@@ -827,6 +827,7 @@ extern my_bool opt_process_can_disable_bin_log;
 
 extern MYSQL_PLUGIN_IMPORT MYSQL_BIN_LOG mysql_bin_log;
 
+bool is_binlog_cache_empty(const THD* thd);
 bool trans_has_updated_trans_table(const THD* thd);
 bool stmt_has_updated_trans_table(Ha_trx_info* ha_list);
 bool ending_trans(THD* thd, const bool all);

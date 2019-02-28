@@ -129,6 +129,7 @@ DROP TABLE t1, t2;
 | PROCESSLIST                           |
 | PROFILING                             |
 | QUERY_ATTRIBUTES                      |
+| QUERY_PERF_COUNTER                    |
 | REFERENTIAL_CONSTRAINTS               |
 | ROCKSDB_CFSTATS                       |
 | ROCKSDB_CF_OPTIONS                    |
@@ -141,9 +142,11 @@ DROP TABLE t1, t2;
 | ROCKSDB_LOCKS                         |
 | ROCKSDB_PERF_CONTEXT                  |
 | ROCKSDB_PERF_CONTEXT_GLOBAL           |
+| ROCKSDB_SST_PROPS                     |
 | ROCKSDB_TRX                           |
 | ROUTINES                              |
 | SCHEMATA                              |
+| SCHEMATA_EXT                          |
 | SCHEMA_PRIVILEGES                     |
 | SESSION_STATUS                        |
 | SESSION_VARIABLES                     |
@@ -215,6 +218,7 @@ DROP TABLE t1, t2;
 | PROCESSLIST                           |
 | PROFILING                             |
 | QUERY_ATTRIBUTES                      |
+| QUERY_PERF_COUNTER                    |
 | REFERENTIAL_CONSTRAINTS               |
 | ROCKSDB_CFSTATS                       |
 | ROCKSDB_CF_OPTIONS                    |
@@ -227,9 +231,11 @@ DROP TABLE t1, t2;
 | ROCKSDB_LOCKS                         |
 | ROCKSDB_PERF_CONTEXT                  |
 | ROCKSDB_PERF_CONTEXT_GLOBAL           |
+| ROCKSDB_SST_PROPS                     |
 | ROCKSDB_TRX                           |
 | ROUTINES                              |
 | SCHEMATA                              |
+| SCHEMATA_EXT                          |
 | SCHEMA_PRIVILEGES                     |
 | SESSION_STATUS                        |
 | SESSION_VARIABLES                     |

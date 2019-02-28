@@ -123,6 +123,7 @@
 #ifndef EMBEDDED_LIBRARY
 #include "perf_counters.h"
 #endif
+#include "query_tag_perf_counter.h"
 
 #ifdef HAVE_JEMALLOC
 #ifndef EMBEDDED_LIBRARY
@@ -758,6 +759,7 @@ bool support_high_priority(enum enum_sql_command command)
     case SQLCOM_CREATE_TRIGGER:
     case SQLCOM_DROP_TRIGGER:
     case SQLCOM_OPTIMIZE:
+    case SQLCOM_LOCK_TABLES:
       return true;
 
     default:
@@ -899,7 +901,7 @@ static void handle_bootstrap_impl(THD *thd)
         break;
       }
 
-      thd->protocol->end_statement();
+      thd->protocol->end_statement(thd);
       bootstrap_error= 1;
       break;
     }
@@ -924,7 +926,7 @@ static void handle_bootstrap_impl(THD *thd)
     Parser_state parser_state;
     if (parser_state.init(thd, thd->query(), length))
     {
-      thd->protocol->end_statement();
+      thd->protocol->end_statement(thd);
       bootstrap_error= 1;
       break;
     }
@@ -932,7 +934,7 @@ static void handle_bootstrap_impl(THD *thd)
     mysql_parse(thd, thd->query(), length, &parser_state, NULL, NULL);
     sql_print_information("query: %s", thd->query());
     bootstrap_error= thd->is_error();
-    thd->protocol->end_statement();
+    thd->protocol->end_statement(thd);
 
 #if defined(ENABLED_PROFILING)
     thd->profiling.finish_current_query();
@@ -1133,7 +1135,7 @@ bool do_command(THD *thd)
 
     /* The error must be set. */
     DBUG_ASSERT(thd->is_error());
-    thd->protocol->end_statement();
+    thd->protocol->end_statement(thd);
 
     /* Mark the statement completed. */
     MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
@@ -1187,27 +1189,6 @@ bool do_command(THD *thd)
     net, timeout_from_seconds(thd->variables.net_read_timeout_seconds));
 
   DBUG_ASSERT(packet_length);
-
-  if (command == COM_QUERY_ATTRS) {
-    auto packet_ptr = packet+1;
-    /*
-      Save query attributes.
-     */
-    size_t attrs_len= net_field_length((uchar**) &packet_ptr);
-    thd->set_query_attrs(CSET_STRING(packet_ptr, attrs_len, thd->charset()));
-
-    auto attrs_len_bytes = net_length_size(attrs_len);
-    packet_length -= (attrs_len_bytes + attrs_len);
-    packet += attrs_len_bytes + attrs_len; // command byte gets jumped below
-
-    bool is_rpc_query = false;
-    return_value= handle_com_rpc(thd, packet+1, (uint) (packet_length-1),
-                                  &is_rpc_query);
-    if (is_rpc_query)
-      goto out;
-    // otherwise let it fall through to dispatch_command()
-    command = COM_QUERY;
-  }
 
   return_value= dispatch_command(command, thd, packet+1, (uint) (packet_length-1));
 
@@ -1554,6 +1535,10 @@ static std::shared_ptr<utils::PerfCounterFactory> pc_factory=
   utils::PerfCounterFactory::getFactory(perf_counter_factory_name);
 #endif
 
+static inline bool is_query(enum enum_server_command command) {
+  return command == COM_QUERY || command == COM_QUERY_ATTRS;
+}
+
 /**
   Perform one connection-level (COM_XXXX) command.
 
@@ -1576,7 +1561,7 @@ static std::shared_ptr<utils::PerfCounterFactory> pc_factory=
         COM_QUIT/COM_SHUTDOWN
 */
 bool dispatch_command(enum enum_server_command command, THD *thd, char* packet,
-                      uint packet_length, Srv_session* srv_session)
+                      uint packet_length)
 {
   NET *net= &thd->net;
   bool error= 0;
@@ -1591,14 +1576,27 @@ bool dispatch_command(enum enum_server_command command, THD *thd, char* packet,
   DBUG_ENTER("dispatch_command");
   DBUG_PRINT("info",("packet: '%*.s'; command: %d", packet_length, packet, command));
 
+  bool state_changed = false;
+  THD *save_thd = nullptr;
+  std::shared_ptr<Srv_session> srv_session;
+
+  if (command == COM_QUERY_ATTRS) {
+    auto packet_ptr = packet;
+    /*
+      Save query attributes.
+     */
+    size_t attrs_len= net_field_length((uchar**) &packet_ptr);
+    thd->set_query_attrs(packet_ptr, attrs_len);
+
+    auto bytes_to_skip = attrs_len + net_length_size(attrs_len);
+    packet_length -= bytes_to_skip;
+    packet += bytes_to_skip; // command byte gets jumped below
+  }
+
 #ifndef EMBEDDED_LIBRARY
   // do collection of samples for passed in "traceid"
-  std::string traceId;
-  std::unordered_map<std::string, std::string>::const_iterator tid_iter;
-  if (!thd->query_attrs_map.empty() &&
-      (tid_iter= thd->query_attrs_map.find("traceid")) !=
-       thd->query_attrs_map.end()) {
-    thd->trace_id = tid_iter->second;
+  thd->parse_query_info_attr();
+  if (!thd->trace_id.empty()) {
     if (!thd->query_perf) {
       thd->query_perf= pc_factory->makeSharedPerfCounter(
         utils::PerfCounterMode::PCM_THREAD,
@@ -1713,7 +1711,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd, char* packet,
     COM_QUIT should work even for expired statements.
   */
   if (unlikely(thd->security_ctx->password_expired &&
-               command != COM_QUERY &&
+               !is_query(command) &&
                command != COM_STMT_CLOSE &&
                command != COM_STMT_SEND_LONG_DATA &&
                command != COM_PING &&
@@ -1801,6 +1799,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd, char* packet,
       }
 #endif /* NO_EMBEDDED_ACCESS_CHECKS */
       mysql_mutex_lock(&thd->LOCK_thd_data);
+      per_user_session_variables.set_thd(thd);
       my_free(save_db);
       mysql_mutex_unlock(&thd->LOCK_thd_data);
       my_free(save_security_ctx.user);
@@ -1838,6 +1837,27 @@ bool dispatch_command(enum enum_server_command command, THD *thd, char* packet,
     mysqld_stmt_reset(thd, packet, packet_length);
     break;
   }
+  case COM_QUERY_ATTRS:
+  {
+    bool rpc_error;
+    std::tie(rpc_error, srv_session) = handle_com_rpc(thd);
+    if (rpc_error) {
+      goto done;
+    }
+
+    if (srv_session != nullptr) {
+      // Switch to use the detached session's thd - will be restored at the end
+      save_thd = thd;
+      thd = srv_session->get_thd();
+      thd->set_command(command);
+      thd->set_query_id(save_thd->query_id);
+#if defined(ENABLED_PROFILING)
+      thd->profiling.start_new_query();
+#endif
+    }
+
+    // Fall through to COM_QUERY
+  }
   case COM_QUERY:
   {
     DBUG_ASSERT(thd->m_digest == NULL);
@@ -1848,6 +1868,9 @@ bool dispatch_command(enum enum_server_command command, THD *thd, char* packet,
     size_t query_len= packet_length;
     if (alloc_query(thd, query_ptr, query_len))
       break;					// fatal error is set
+
+    qutils::query_tag_perf_counter counter(thd);
+
     MYSQL_QUERY_START(thd->query(), thd->thread_id,
                       (char *) (thd->db ? thd->db : ""),
                       &thd->security_ctx->priv_user[0],
@@ -1904,9 +1927,14 @@ bool dispatch_command(enum enum_server_command command, THD *thd, char* packet,
       */
       char *beginning_of_next_stmt= (char*) parser_state.m_lip.found_semicolon;
 
+      /* Check to see if any state changed */
+      if (!state_changed && srv_session) {
+        state_changed = srv_session->session_state_changed();
+      }
+
       /* Finalize server status flags after executing a statement. */
       thd->update_server_status();
-      thd->protocol->end_statement();
+      thd->protocol->end_statement(thd);
       query_cache_end_of_result(thd);
 
       mysql_audit_general(thd, MYSQL_AUDIT_GENERAL_STATUS,
@@ -2361,13 +2389,25 @@ done:
   if (thd->killed)
     thd->send_kill_message();
 
-  // if it's a COM RPC, set session id in message to be appended in OK and
-  // and mark session to be released before sending the response out.
-  if (srv_session) {
-    srv_session_end_statement(srv_session);
+  /* Check to see if any state changed */
+  if (!state_changed && srv_session) {
+    state_changed = srv_session->session_state_changed();
   }
 
-  thd->protocol->end_statement();
+  if (((thd->ull != NULL) ||                     // user lock set
+       (thd->locked_tables_mode != LTM_NONE)) && // LOCK table active
+      thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)
+          ->is_enabled()) {
+    thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)
+        ->mark_as_changed(thd, NULL);
+  }
+
+  // if it's a COM RPC, set session id in message to be appended in OK
+  if (srv_session) {
+    srv_session_end_statement(*srv_session);
+  }
+
+  thd->protocol->end_statement(thd);
   query_cache_end_of_result(thd);
 
   if (!thd->is_error() && !thd->killed_errno())
@@ -2390,6 +2430,7 @@ done:
 
   thd->reset_query();
   thd->reset_query_attrs();
+  thd->get_tracker()->reset_audit_attrs();
   thd->set_command(COM_SLEEP);
   thd->proc_info= 0;
 
@@ -2407,7 +2448,7 @@ done:
   {
     int res MY_ATTRIBUTE((unused));
     res= (int) thd->is_error();
-    if (command == COM_QUERY)
+    if (is_query(command))
     {
       MYSQL_QUERY_DONE(res);
     }
@@ -2430,14 +2471,14 @@ done:
     {
       USER_STATS *us= thd_get_user_stats(thd);
       update_user_stats_after_statement(us, thd, wall_time,
-                                        command != COM_QUERY,
+                                        !is_query(command),
                                         FALSE, &start_perf_read,
                                         &start_perf_read_blob,
                                         &start_perf_read_primary,
                                         &start_perf_read_secondary);
       DB_STATS *dbstats= thd->db_stats;
       if (dbstats)
-        update_db_stats_after_statement(dbstats, thd, command != COM_QUERY);
+        update_db_stats_after_statement(dbstats, thd, !is_query(command));
     }
 #endif
   }
@@ -2446,6 +2487,16 @@ done:
   {
     USER_STATS *us= thd_get_user_stats(thd);
     us->queries_empty.inc();
+  }
+
+  // if it's a COM RPC, clean up all the server session information
+  if (srv_session) {
+    thd = save_thd;
+    cleanup_com_rpc(thd, std::move(srv_session), state_changed);
+    thd->set_command(COM_SLEEP);
+#if defined(ENABLED_PROFILING)
+    thd->profiling.finish_current_query();
+#endif
   }
 
   DBUG_RETURN(error);
@@ -2624,7 +2675,7 @@ bool write_log_to_socket(int sockfd, THD *thd, ulonglong end_utime)
   if (len < buf_sz)
     len += snprintf(buf + len, buf_sz - len,
                     "# User@Host: %s[%s] @ %s [%s]\n",
-                    sctx->priv_user ? sctx->priv_user : "",
+                    sctx->priv_user,
                     sctx->user ? sctx->user : "",
                     sctx->get_host() ? sctx->get_host()->c_ptr() : "",
                     sctx->get_ip() ? sctx->get_ip()->c_ptr() : "");
@@ -3088,7 +3139,7 @@ static int show_memory_status(THD* thd)
     Buffer size in bytes. Should be large enough for per-arena statistics not
     to be truncated.
   */
-  const uint MALLOC_STATUS_LEN= 1000000;
+  const uint MALLOC_STATUS_LEN= 10000000;
 
   field_list.push_back(new Item_empty_string("Status",10));
   if (protocol->send_result_set_metadata(&field_list,
@@ -4134,9 +4185,13 @@ case SQLCOM_PREPARE:
       {
         /* in case of create temp tables if @@session_track_state_change is
            ON then send session state notification in OK packet */
+        auto tracker =
+            thd->get_tracker()->get_tracker(SESSION_STATE_CHANGE_TRACKER);
         if(create_info.options & HA_LEX_CREATE_TMP_TABLE &&
-           thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)->is_enabled())
-          thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)->mark_as_changed(thd, NULL);
+            tracker->is_enabled()) {
+          tracker->mark_as_changed(thd, NULL);
+        }
+
         my_ok(thd);
       }
     }
@@ -4730,8 +4785,10 @@ end_with_restore_list:
        send the boolean tracker in the OK packet */
     if(!res && lex->drop_temporary)
     {
-      if (thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)->is_enabled())
-        thd->session_tracker.get_tracker(SESSION_STATE_CHANGE_TRACKER)->mark_as_changed(thd, NULL);
+      auto tracker =
+          thd->get_tracker()->get_tracker(SESSION_STATE_CHANGE_TRACKER);
+      if (tracker->is_enabled())
+        tracker->mark_as_changed(thd, NULL);
     }
   }
   break;
@@ -5428,6 +5485,21 @@ end_with_restore_list:
     break;
   }
 #endif
+  case SQLCOM_CREATE_EXPLICIT_SNAPSHOT:
+  {
+    thd->create_explicit_snapshot();
+    break;
+  }
+  case SQLCOM_ATTACH_EXPLICIT_SNAPSHOT:
+  {
+    thd->attach_explicit_snapshot(lex->snapshot_id);
+    break;
+  }
+  case SQLCOM_RELEASE_EXPLICIT_SNAPSHOT:
+  {
+    thd->release_explicit_snapshot();
+    break;
+  }
   case SQLCOM_BEGIN:
   {
     bool need_ok = true;
@@ -8735,7 +8807,7 @@ uint kill_one_thread(THD *thd, my_thread_id id, bool only_kill_query)
   // maybe it's a srv_session id
   std::shared_ptr<Srv_session> srv_session;
 #ifndef EMBEDDED_LIBRARY
-  srv_session = Srv_session::find_session(id);
+  srv_session = Srv_session::access_session(id);
 
   if (srv_session)
   {
@@ -8744,23 +8816,35 @@ uint kill_one_thread(THD *thd, my_thread_id id, bool only_kill_query)
       // remove session from map
       DBUG_PRINT("info", ("Kill CONN for srv_session, removing session."));
       Srv_session::remove_session(id);
+
+      // For safety, clear the db_read_only_hash data structure. This is
+      // because after a THD is removed from the srv_session map in the above
+      // remove_session call, it's possible for entries in that hash to be
+      // free'd, without this THD being updated to reflect that. This is
+      // because this THD now exists outside of both global_thread_list and
+      // the srv_session map, and cannot updated by other threads.
+      //
+      // It's unlikely that the kill code paths will need to read from
+      // db_read_only_hash, but it's hard to verify all codepaths.
+      tmp = srv_session->get_thd();
+      mysql_mutex_lock(&tmp->LOCK_thd_db_read_only_hash);
+      my_hash_free(&tmp->db_read_only_hash);
+      mysql_mutex_unlock(&tmp->LOCK_thd_db_read_only_hash);
     }
+    // We can't exit early if the session is not attached because
+    // it might have already been removed from the map
     // continue executing code below with conn thread id
-    auto conn_id = srv_session->get_conn_thd_id();
-    if (conn_id == 0) // session is not attached
-    {
-      DBUG_PRINT("info", ("Requested KILL of unattached srv session id=%d",
-                          srv_session->get_session_id()));
-      DBUG_RETURN(0);
-    }
     // continue to kill the query, set only_kill_query=true as connection
     // should still remain active
     only_kill_query = true;
     tmp = srv_session->get_thd();
     mysql_mutex_lock(&tmp->LOCK_thd_data);
-    DBUG_PRINT("info", ("Found srv_session to kill conn_thid=%d", conn_id));
+#ifndef DBUG_OFF
+    auto conn_id = srv_session->get_conn_thd_id();
+    DBUG_PRINT("info", ("Found srv_session to kill conn_thd=%d", conn_id));
+#endif // DBUG_OFF
   }
-#endif
+#endif // EMBEDDED_LIBRARY
 
   if (!srv_session)
   {
@@ -9396,7 +9480,7 @@ bool block_memory_tables(HA_CREATE_INFO *create_info,
       strcmp(table_list->db, "mtr") &&
       create_info->db_type &&
       create_info->db_type->db_type == DB_TYPE_HEAP &&
-      !create_info->options & HA_LEX_CREATE_TMP_TABLE)
+      !(create_info->options & HA_LEX_CREATE_TMP_TABLE))
     return true;
   return false;
 }
@@ -9418,7 +9502,8 @@ bool should_check_table_for_primary_key(HA_CREATE_INFO *create_info,
 {
   return (block_create_no_primary_key &&
           create_info->db_type &&
-          create_info->db_type->db_type == DB_TYPE_INNODB &&
+          (create_info->db_type->db_type == DB_TYPE_INNODB ||
+            create_info->db_type->db_type == DB_TYPE_ROCKSDB) &&
           !(create_info->options & HA_LEX_CREATE_TMP_TABLE) &&
           strcmp(table_list->db, "mysql") != 0 &&
           strcmp(table_list->db, "mtr") != 0);
@@ -10110,7 +10195,7 @@ THD* get_opt_thread_with_data_lock(THD *thd, ulong thread_id)
 void get_active_master_info(std::string *str_ptr)
 {
 #ifdef HAVE_REPLICATION
-    if (str_ptr && active_mi && active_mi->host && active_mi->host[0])
+    if (str_ptr && active_mi && active_mi->host[0])
     {
       *str_ptr = "Current master_host: ";
       *str_ptr += active_mi->host;

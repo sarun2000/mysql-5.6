@@ -55,6 +55,10 @@
 #include "sql_data_change.h"
 #include "my_atomic.h"
 #include "sql_db.h"
+#include "rpl_master.h"
+
+#include <boost/property_tree/ptree.hpp>
+using boost::property_tree::ptree;
 
 #define FLAGSTR(V,F) ((V)&(F)?#F" ":"")
 
@@ -634,6 +638,8 @@ typedef struct system_variables
   long      optimizer_trace_limit;
   ulong     optimizer_trace_max_mem_size;
   my_bool   optimizer_low_limit_heuristic;
+  my_bool   optimizer_force_index_for_range;
+  my_bool   optimizer_full_scan;
   sql_mode_t sql_mode; ///< which non-standard SQL behaviour should be enabled
   ulonglong option_bits; ///< OPTION_xxx constants, e.g. OPTION_PROFILING
   ha_rows select_limit;
@@ -784,8 +790,10 @@ typedef struct system_variables
   uint select_into_file_fsync_timeout;
 
   my_bool high_priority_ddl;
+  my_bool kill_conflicting_connections;
 
   my_bool session_track_state_change;
+  my_bool session_track_response_attributes;
 
   ulong dscp_on_socket;
 } SV;
@@ -2467,6 +2475,9 @@ public:
   /* record the engine commit time */
   ulonglong engine_commit_time = 0;
 
+  /* semi-sync whitelist version number for this thread */
+  ulonglong semisync_whitelist_ver = 0;
+
   /* whether the session is already in admission control for queries */
   bool is_in_ac = false;
   /**
@@ -2655,6 +2666,10 @@ public:
                         const uchar *old_data, const uchar *new_data,
                         const uchar* extra_row_info);
   void binlog_prepare_row_images(TABLE* table, bool is_update);
+
+  std::string gen_trx_metadata();
+  void add_time_metadata(ptree &meta_data_root);
+  void add_db_metadata(ptree &meta_data_root);
 
   void set_server_id(uint32 sid) { server_id = sid; }
 
@@ -2876,7 +2891,7 @@ public:
       bool xid_written;               // The session wrote an XID
       bool real_commit;               // Is this a "real" commit?
       bool commit_low;                // see MYSQL_BIN_LOG::ordered_commit
-      bool run_hooks;                 // Call the before_commit hook
+      bool run_hooks;                 // Call the after_commit hook
 #ifndef DBUG_OFF
       bool ready_preempt;             // internal in MYSQL_BIN_LOG::ordered_commit
 #endif
@@ -3192,6 +3207,72 @@ private:
     changed or written.
   */
   ulonglong m_accessed_rows_and_keys;
+
+private:
+  std::shared_ptr<explicit_snapshot> m_explicit_snapshot;
+
+public:
+  /**
+   * Creates an explicit snapshot and associates it with the current conn
+   * return true if error, false otherwise
+   */
+  inline bool create_explicit_snapshot()
+  {
+    auto hton= lex->create_info.db_type;
+    snapshot_info_st ss_info;
+    ss_info.op= snapshot_operation::SNAPSHOT_CREATE;
+    bool error= ha_explicit_snapshot(this, hton, &ss_info);
+#ifdef HAVE_REPLICATION
+    bool need_ok = true;
+    error= error || show_master_offset(this, ss_info, &need_ok);
+#endif
+    return error;
+  }
+
+  inline std::shared_ptr<explicit_snapshot> get_explicit_snapshot()
+  {
+    return m_explicit_snapshot;
+  }
+
+  inline void set_explicit_snapshot(std::shared_ptr<explicit_snapshot> s)
+  {
+    m_explicit_snapshot= s;
+  }
+
+  /**
+   * Attaches an existing explicit snapshot to the current conn
+   * return true if error, false otherwise
+   */
+  inline bool attach_explicit_snapshot(const ulonglong snapshot_id)
+  {
+    auto hton= lex->create_info.db_type;
+    snapshot_info_st ss_info;
+    ss_info.snapshot_id= snapshot_id;
+    ss_info.op= snapshot_operation::SNAPSHOT_ATTACH;
+    bool error= ha_explicit_snapshot(this, hton, &ss_info);
+#ifdef HAVE_REPLICATION
+    bool need_ok = true;
+    error= error || show_master_offset(this, ss_info, &need_ok);
+#endif
+    return error;
+  }
+
+  /**
+   * Releases the explicit snapshot associated with the current conn
+   * return true if error, false otherwise
+   */
+  inline bool release_explicit_snapshot()
+  {
+    auto hton= lex->create_info.db_type;
+    snapshot_info_st ss_info;
+    ss_info.op= snapshot_operation::SNAPSHOT_RELEASE;
+    bool error= ha_explicit_snapshot(this, hton, &ss_info);
+#ifdef HAVE_REPLICATION
+    bool need_ok = true;
+    error= error || show_master_offset(this, ss_info, &need_ok);
+#endif
+    return error;
+  }
 
 private:
   USER_CONN *m_user_connect;
@@ -3995,6 +4076,10 @@ public:
   void set_stmt_da(Diagnostics_area *da)
   { m_stmt_da= da; }
 
+  /// Resets the Diagnostics-area for the current statement.
+  void reset_stmt_da()
+  { m_stmt_da= &main_da; }
+
 public:
   inline const CHARSET_INFO *charset()
   { return variables.character_set_client; }
@@ -4550,69 +4635,32 @@ public:
 
   void mark_transaction_to_rollback(bool all);
 
-  void set_query_attrs(const CSET_STRING &arg)
-  {
-    query_attrs_string= arg;
-    set_attrs_map(query_attrs_string.str(), query_attrs_string.length(),
-        query_attrs_map, true);
-  }
+  void set_connection_attrs(const char *attrs, size_t length);
+  void set_query_attrs(const char *attrs, size_t length);
+  void set_query_attrs(const std::unordered_map<std::string, std::string>& attrs);
+  int parse_query_info_attr();
   void reset_query_attrs()
   {
-    query_attrs_string= CSET_STRING();
+    mysql_mutex_lock(&LOCK_thd_data);
     query_attrs_map.clear();
+    mysql_mutex_unlock(&LOCK_thd_data);
+
+    query_attrs_string.clear();
     trace_id.clear();
+    num_queries = 0;
+    query_type.clear();
   }
-  inline char *query_attrs() const { return query_attrs_string.str(); }
+  inline const char *query_attrs() const
+  {
+    return query_attrs_string.c_str();
+  }
   inline uint32 query_attrs_length() const
   {
     return query_attrs_string.length();
   }
 
-  void set_connection_attrs(const char *attrs, size_t length)
-  {
-    mysql_mutex_lock(&LOCK_thd_data);
-    set_attrs_map(attrs, length, connection_attrs_map, false);
-    mysql_mutex_unlock(&LOCK_thd_data);
-  }
-
   std::unordered_map<std::string, std::string> query_attrs_map;
   std::unordered_map<std::string, std::string> connection_attrs_map;
-
-private:
-  void set_attrs_map(const char *ptr, size_t length,
-                     std::unordered_map<std::string, std::string> &attrs_map,
-                     bool is_query)
-  {
-    const char *end = ptr + length;
-
-    const char *key, *value;
-    size_t klen, vlen;
-
-    if (is_query)
-      DBUG_EXECUTE_IF("print_query_attr", {
-          // NO_LINT_DEBUG
-          fprintf(stderr, "[query-attrs][list]\n");
-      });
-
-    attrs_map.clear();
-    while (ptr < end)
-    {
-      klen = net_field_length((uchar**) &ptr);
-      key = ptr;
-      ptr += klen;
-      vlen = net_field_length((uchar**) &ptr);
-      value = ptr;
-      ptr += vlen;
-      attrs_map[std::string(key, klen)] = std::string(value, vlen);
-      if (is_query)
-        DBUG_EXECUTE_IF("print_query_attr", {
-            // NO_LINT_DEBUG
-            fprintf(stderr, "[query-attrs][key] %.*s\n", (int)klen, key);
-            // NO_LINT_DEBUG
-            fprintf(stderr, "[query-attrs][value] %.*s\n", (int)vlen, value);
-        });
-    }
-  }
 
 private:
   char* connection_certificate_buf;
@@ -4641,8 +4689,6 @@ public:
 #endif
 
 private:
-  CSET_STRING query_attrs_string;
-
   /** The current internal error handler for this thread, or NULL. */
   Internal_error_handler *m_internal_handler;
 
@@ -4709,6 +4755,14 @@ public:
   // ExecutionContextImpl is used for native procedures.
   ExecutionContextImpl *ec;
 
+  bool is_thd_priority_alt() { return thd_priority_alt; }
+  void mark_thd_priority_as_alt()
+  {
+    mysql_mutex_lock(&LOCK_thd_data);
+    thd_priority_alt = true;
+    mysql_mutex_unlock(&LOCK_thd_data);
+  }
+
   bool is_a_srv_session() const { return is_a_srv_session_thd; }
   void mark_as_srv_session() { is_a_srv_session_thd= true; }
 
@@ -4717,14 +4771,16 @@ public:
   }
 
   void set_default_srv_session(std::shared_ptr<Srv_session> session) {
-    default_srv_session = session;
+    default_srv_session = std::move(session);
   }
 
   void set_attached_srv_session(std::shared_ptr<Srv_session> srv_session) {
     mysql_mutex_lock(&LOCK_thd_data);
-    attached_srv_session = srv_session;
+    attached_srv_session = std::move(srv_session);
     mysql_mutex_unlock(&LOCK_thd_data);
   }
+
+  Session_tracker* get_tracker();
 
   // called for "show processlist" from another thread
   std::shared_ptr<Srv_session> get_attached_srv_session() {
@@ -4747,6 +4803,9 @@ private:
   */
   bool is_a_srv_session_thd = false;
 
+  /*Variable to mark weather nice value of this thread changed or not*/
+  bool thd_priority_alt = false;
+
   /**
    * Set only in Conn THD points to the attached srv session.
    * Filled in only while executing the query for the attached session.
@@ -4762,6 +4821,15 @@ public:
   std::shared_ptr<utils::PerfCounter> query_perf;
   std::string trace_id;
   uint64_t pc_val;
+  std::string query_attrs_string;
+  uint64_t num_queries;
+  std::string query_type;
+
+  void copy_client_charset_settings(const THD* other) {
+    variables.character_set_client= other->variables.character_set_client;
+    variables.collation_connection= other->variables.collation_connection;
+    variables.character_set_results= other->variables.character_set_results;
+  }
 };
 
 /*

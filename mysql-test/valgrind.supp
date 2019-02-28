@@ -17,6 +17,9 @@
 #
 # Suppress some common (not fatal) errors in system libraries found by valgrind
 #
+# Use ./mtr --valgrind-option=--gen-suppressions=all to tell valgrind to 
+# print a suppression after every error it finds.
+#
 
 #
 # Pthread doesn't free all thread specific memory before program exists
@@ -40,9 +43,20 @@
 }
 
 {
+   pthread allocate_tls memory loss
+   Memcheck:Leak
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create*
+}
+
+{
    pthead_exit memory loss 1
    Memcheck:Leak
    fun:malloc
+   ...
    fun:_dl_new_object
    fun:_dl_map_object_from_fd
 }
@@ -51,6 +65,7 @@
    pthread_exit memory loss 2
    Memcheck:Leak
    fun:malloc
+   ...
    fun:_dl_map_object
    fun:dl_open_worker
 }
@@ -59,6 +74,7 @@
    pthread_exit memory loss 3
    Memcheck:Leak
    fun:malloc
+   ...
    fun:_dl_map_object_deps
    fun:dl_open_worker
 }
@@ -67,6 +83,7 @@
    pthread_exit memory loss 4
    Memcheck:Leak
    fun:calloc
+   ...
    fun:_dl_check_map_versions
    fun:dl_open_worker
 }
@@ -75,6 +92,7 @@
    pthread_exit memory loss 5
    Memcheck:Leak
    fun:calloc
+   ...
    fun:_dl_new_object
    fun:_dl_map_object_from_fd
 }
@@ -805,6 +823,46 @@
    fun:buf_buddy_free
 }
 
+
+# Once-per instance initialization leaks
+{
+   Once-per initialization leaks
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_Z27set_gap_lock_exception_listP7sys_varP3THD13enum_var_type
+   fun:_ZL11get_optionsPiPPPcc
+   ...
+}
+
+{
+   Once-per initialization leaks
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_Z28set_legacy_user_name_patternP7sys_varP3THD13enum_var_type
+   fun:_ZL11get_optionsPiPPPcc
+   ...
+}
+
+{
+   Once-per initialization leaks
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_ZL22init_server_componentsv
+   ...
+}
+
+{
+   Once-per initialization leaks
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_Z21init_common_variablesc
+   ...
+}
+
 # Note the wildcard in the (mangled) function signatures of
 # write_keys() and find_all_keys().
 # They both return ha_rows, which is platform dependent.
@@ -1007,6 +1065,16 @@
    fun:getaddrinfo
 }
 
+{
+   ssl_acceptor_fd is static
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:new_ssl_acceptor_fd
+   fun:init_ssl
+   ...
+}
+
 #
 # RocksDB Storage Engine suppressions
 #
@@ -1079,6 +1147,15 @@
    fun:_ZN7rocksdb10autovectorIjLm8EE9push_backERKj
    fun:_ZN7rocksdb14ThreadLocalPtr10StaticMeta9ReclaimIdEj
    fun:_ZN7rocksdb14ThreadLocalPtrD1Ev
+   ...
+}
+
+{
+   Static initialization
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_Z41__static_initialization_and_destruction_0ii
    ...
 }
 
@@ -1168,6 +1245,35 @@
    fun:new_VioSSLFd
    ...
 }
+{
+   TLS data on main thread is not cleaned up properly
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   fun:malloc
+   ...
+   fun:ec_group_new_from_data
+   ...
+   fun:new_VioSSLFd
+   ...
+}
+{
+   TLS data on main thread is not cleaned up properly
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   fun:malloc
+   fun:OPENSSL_malloc
+   ...
+   fun:do_start_connect
+   fun:_ZN4bssl20ssl_client_handshakeEPNS_13SSL_HANDSHAKEE
+   fun:_ZN4bssl17ssl_run_handshakeEPNS_13SSL_HANDSHAKEEPb
+   fun:SSL_do_handshake
+   fun:SSL_connect
+   fun:ssl_handshake_loop
+   fun:ssl_do
+   fun:sslconnect
+   fun:run_ssl_connect
+   ...
+}
 
 {
    Valgrind complains about std::unordered_map ctor in ha_rocksdb
@@ -1189,5 +1295,105 @@
   fun:_ZNSt10_HashtableIPKvSt4pairIKS1_N7rocksdb24ConstantColumnFamilyInfoEESaIS6_ENSt8__detail10_Select1stESt8equal_toIS1_ESt4hashIS1_ENS8_18_Mod_range_hashingENS8_20_Default_ranged_hashENS8_20_Prime_rehash_policyENS8_17_Hashtable_traitsILb0ELb0ELb1EEEE7emplaceIIRKSt21piecewise_construct_tSt5tupleIIS1_EESO_IIS1_NSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESV_EEEEES2_INS8_14_Node_iteratorIS6_Lb0ELb0EEEbEDpOT_
   fun:_ZNSt13unordered_mapIPKvN7rocksdb24ConstantColumnFamilyInfoESt4hashIS1_ESt8equal_toIS1_ESaISt4pairIKS1_S3_EEE7emplaceIIRKSt21piecewise_construct_tSt5tupleIIS1_EESH_IIS1_NSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESO_EEEEES8_INSt8__detail14_Node_iteratorISA_Lb0ELb0EEEbEDpOT_
   fun:_ZN7rocksdb19ThreadStatusUpdater19NewColumnFamilyInfoEPKvRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES2_SA_
+  ...
+}
+
+{
+  Valgrind complains about still-reachable memory in std::unordered_map in Rocksdb
+  Memcheck:Leak
+  match-leak-kinds: reachable
+  ...
+  fun:_ZNSt10_HashtableIPKvSt4pairIKS1_N7rocksdb24ConstantColumnFamilyInfoEESaIS6_ENSt8__detail10_Select1stESt8equal_toIS1_ESt4hashIS1_ENS8_18_Mod_range_hashingENS8_20_Default_ranged_hashENS8_20_Prime_rehash_policyENS8_17_Hashtable_traitsILb0ELb0ELb1EEEE7emplaceIJRKSt21piecewise_construct_tSt5tupleIJS1_EESO_IJS1_NSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESV_EEEEES2_INS8_14_Node_iteratorIS6_Lb0ELb0EEEbEDpOT_
+  fun:_ZNSt13unordered_mapIPKvN7rocksdb24ConstantColumnFamilyInfoESt4hashIS1_ESt8equal_toIS1_ESaISt4pairIKS1_S3_EEE7emplaceIJRKSt21piecewise_construct_tSt5tupleIJS1_EESH_IJS1_NSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESO_EEEEES8_INSt8__detail14_Node_iteratorISA_Lb0ELb0EEEbEDpOT_
+  fun:_ZN7rocksdb19ThreadStatusUpdater19NewColumnFamilyInfoEPKvRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES2_SA_
+}
+
+{
+   Valgrind complains about still-reachable memory in std::unordered_set in Rocksdb
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_ZNSt8__detail9_Map_baseIPKvSt4pairIKS2_St13unordered_setIS2_St4hashIS2_ESt8equal_toIS2_ESaIS2_EEESaISC_ENS_10_Select1stES9_S7_NS_18_Mod_range_hashingENS_20_Default_ranged_hashENS_20_Prime_rehash_policyENS_17_Hashtable_traitsILb0ELb0ELb1EEELb1EEixERS4_
+   fun:_ZNSt13unordered_mapIPKvSt13unordered_setIS1_St4hashIS1_ESt8equal_toIS1_ESaIS1_EES4_S6_SaISt4pairIKS1_S8_EEEixERSA_
+   fun:_ZN7rocksdb19ThreadStatusUpdater19NewColumnFamilyInfoEPKvRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES2_SA_   
+}
+
+{
+   Valgrind complains about still-reachable memory in std::unordered_set in Rocksdb
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_ZNSt8__detail12_Insert_baseIPN7rocksdb16ThreadStatusDataES3_SaIS3_ENS_9_IdentityESt8equal_toIS3_ESt4hashIS3_ENS_18_Mod_range_hashingENS_20_Default_ranged_hashENS_20_Prime_rehash_policyENS_17_Hashtable_traitsILb0ELb1ELb1EEEE6insertERKS3_
+   fun:_ZNSt13unordered_setIPN7rocksdb16ThreadStatusDataESt4hashIS2_ESt8equal_toIS2_ESaIS2_EE6insertERKS2_
+   fun:_ZN7rocksdb19ThreadStatusUpdater14RegisterThreadENS_12ThreadStatus10ThreadTypeEm
+}
+
+{
+   Clang lowers the copy assignment operator of POD struct into memcpy, even when src and dst may alias
+   Memcheck:Overlap
+   fun:memcpy@@GLIBC_2.14
+   fun:_ZN7rocksdb27AdvancedColumnFamilyOptionsaSERKS0_
+}
+
+{
+   Clang lowers the copy assignment operator of POD struct into memcpy, even when src and dst may alias
+   Memcheck:Overlap
+   fun:memcpy@@GLIBC_2.14
+   fun:_ZN7rocksdb19ColumnFamilyOptionsaSERKS0_
+}
+
+{
+   Clang lowers the copy assignment operator of POD struct into memcpy, even when src and dst may alias
+   Memcheck:Overlap
+   fun:memcpy@@GLIBC_2.14
+   fun:update_state_info
+}
+
+{
+   Clang lowers the copy assignment operator of POD struct into memcpy, even when src and dst may alias
+   Memcheck:Overlap
+   fun:memcpy@@GLIBC_2.14
+   fun:mi_extra
+}
+
+#Suppress warnings from initialization of glibc network functions
+
+{
+  <getaddrinfo>
+  Memcheck:Leak
+  ...
+  fun:getaddrinfo
+  ...
+}
+
+{
+  <getmntent>
+  Memcheck:Leak
+  ...
+  fun:getmntent
+  ...
+}
+
+{
+  <gethostbyname>
+  Memcheck:Leak
+  ...
+  fun:gethostbyname
+  ...
+}
+
+{
+  <gethostbyaddr>
+  Memcheck:Leak
+  ...
+  fun:gethostbyaddr
+  ...
+}
+
+{
+  <getnameinfo>
+  Memcheck:Leak
+  ...
+  fun:getnameinfo
   ...
 }

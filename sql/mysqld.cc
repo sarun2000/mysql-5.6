@@ -26,6 +26,7 @@
 
 #include "sql_priv.h"
 #include "unireg.h"
+#include <algorithm>
 #include <signal.h>
 #include "sql_parse.h"    // test_if_data_home_dir
 #include "sql_cache.h"    // query_cache, query_cache_*
@@ -77,6 +78,7 @@
 #include "opt_trace_context.h"
 #include "sql_multi_tenancy.h"
 #include "native_procedure_priv.h"
+#include "lf.h"
 
 #include "global_threads.h"
 #include "mysqld.h"
@@ -144,9 +146,11 @@
 // about the functionality this change enables.
 extern "C" {
 #if JEMALLOC_VERSION_MAJOR > 4
-  const char* malloc_conf = "";
+  const char* malloc_conf = "prof:true,prof_active:false"
+    ",prof_prefix:jeprof.out";
 #else
-  const char *malloc_conf = "purge:decay";
+  const char *malloc_conf = "purge:decay,prof:true,prof_active:false,"
+    "prof_prefix:jeprof.out";
 #endif
 }
 
@@ -465,12 +469,15 @@ USER_STATS slave_user_stats;
 USER_STATS other_user_stats;
 
 bool opt_bin_log, opt_ignore_builtin_innodb= 0;
+bool opt_trim_binlog= 0;
 my_bool opt_log, opt_slow_log, opt_log_raw;
 ulonglong log_output_options;
 my_bool opt_log_queries_not_using_indexes= 0;
 my_bool opt_disable_working_set_size = 0;
 ulong opt_log_throttle_queries_not_using_indexes= 0;
 ulong opt_log_throttle_legacy_user= 0;
+bool log_sbr_unsafe = 0;
+ulong opt_log_throttle_sbr_unsafe_queries = 0;
 bool opt_improved_dup_key_error= 0;
 bool opt_error_log= IF_WIN(1,0);
 bool opt_disable_networking=0, opt_skip_show_db=0;
@@ -525,8 +532,12 @@ my_bool opt_enable_named_pipe= 0;
 my_bool opt_local_infile, opt_slave_compressed_protocol;
 my_bool opt_slave_compressed_event_protocol;
 ulonglong opt_max_compressed_event_cache_size;
+ulonglong opt_compressed_event_cache_evict_threshold;
 ulong opt_slave_compression_lib;
+ulonglong opt_slave_dump_thread_wait_sleep_usec;
 my_bool rpl_wait_for_semi_sync_ack;
+std::atomic<ulonglong> slave_lag_sla_misses{0};
+ulonglong opt_slave_lag_sla_seconds;
 my_bool opt_safe_user_create = 0;
 my_bool opt_show_slave_auth_info;
 my_bool opt_log_slave_updates= 0;
@@ -547,6 +558,9 @@ handlerton *heap_hton;
 handlerton *myisam_hton;
 handlerton *partition_hton;
 
+/* Wait time on global realonly/commit lock */
+std::atomic_ullong init_global_rolock_timer = {0};
+std::atomic_ullong init_commit_lock_timer = {0};
 uint opt_server_id_bits= 0;
 ulong opt_server_id_mask= 0;
 my_bool send_error_before_closing_timed_out_connection = TRUE;
@@ -592,6 +606,9 @@ ulonglong relay_sql_wait_time= 0;
    It is updated every minute */
 double comp_event_cache_hit_ratio= 0;
 
+/* Number of times async dump threads waited for semi-sync ACK */
+ulonglong repl_semi_sync_master_ack_waits= 0;
+
 /* status variables for binlog fsync histogram */
 SHOW_VAR latency_histogram_binlog_fsync[NUMBER_OF_HISTOGRAM_BINS + 1];
 ulonglong histogram_binlog_fsync_values[NUMBER_OF_HISTOGRAM_BINS];
@@ -621,6 +638,7 @@ my_bool opt_process_can_disable_bin_log = TRUE;
 static const ulong DEFAULT_SRV_FATAL_SEMAPHORE_TIMEOUT = 600; /* in seconds */
 ulong opt_srv_fatal_semaphore_timeout = DEFAULT_SRV_FATAL_SEMAPHORE_TIMEOUT;
 ulong opt_binlog_rows_event_max_size;
+ulonglong opt_binlog_rows_event_max_rows;
 bool opt_log_only_query_comments = false;
 bool opt_binlog_trx_meta_data = false;
 bool opt_log_column_names = false;
@@ -691,6 +709,8 @@ uint slave_rows_last_search_algorithm_used;
 ulonglong binlog_bytes_written = 0;
 ulonglong relay_log_bytes_written = 0;
 ulong binlog_cache_size=0;
+char *enable_jemalloc_hpp;
+char *thread_nice_value = NULL;
 ulonglong  max_binlog_cache_size=0;
 ulong slave_max_allowed_packet= 0;
 ulong binlog_stmt_cache_size=0;
@@ -708,6 +728,7 @@ ulong last_evicted_page_age= 0;
 ulong delayed_insert_timeout, delayed_insert_limit, delayed_queue_size;
 ulong delayed_insert_threads, delayed_insert_writes, delayed_rows_in_use;
 ulong delayed_insert_errors,flush_time;
+bool flush_only_old_table_cache_entries = false;
 ulong specialflag=0;
 ulong binlog_cache_use= 0, binlog_cache_disk_use= 0;
 ulong binlog_stmt_cache_use= 0, binlog_stmt_cache_disk_use= 0;
@@ -717,6 +738,7 @@ ulong opt_max_running_queries, opt_max_waiting_queries;
 my_bool opt_admission_control_by_trx= 0;
 extern AC *db_ac;
 ulong rpl_stop_slave_timeout= LONG_TIMEOUT;
+my_bool rpl_slave_flow_control = 1;
 my_bool rpl_skip_tx_api = 0;
 my_bool log_bin_use_v1_row_events= 0;
 bool thread_cache_size_specified= false;
@@ -976,6 +998,8 @@ mysql_mutex_t LOCK_sql_slave_skip_counter;
 mysql_mutex_t LOCK_slave_net_timeout;
 mysql_mutex_t LOCK_log_throttle_qni;
 mysql_mutex_t LOCK_log_throttle_legacy;
+mysql_mutex_t LOCK_log_throttle_sbr_unsafe;
+
 #ifdef HAVE_OPENSSL
 mysql_mutex_t LOCK_des_key_file;
 mysql_rwlock_t LOCK_use_ssl;
@@ -1051,6 +1075,14 @@ Checkable_rwlock *global_sid_lock= NULL;
 Sid_map *global_sid_map= NULL;
 Gtid_state *gtid_state= NULL;
 extern my_bool opt_core_file;
+
+std::unique_ptr<HHWheelTimer> hhWheelTimer;
+
+/*
+  Since performance schema might not be compiled in, reference
+  LF_HASH_OVERHEAD here to pull in the lf library.
+*/
+int dummy_lf_size= LF_HASH_OVERHEAD;
 
 /*
   global_thread_list and waiting_thd_list are both pointers to objects
@@ -1575,7 +1607,6 @@ static void create_shutdown_file();
 static int delete_shutdown_file();
 static void mysqld_exit(int exit_code) MY_ATTRIBUTE((noreturn));
 #endif
-static void delete_pid_file(myf flags);
 
 
 #ifndef EMBEDDED_LIBRARY
@@ -1753,6 +1784,9 @@ static void close_connections(void)
     mysql_mutex_unlock(&tmp->LOCK_thd_data);
   }
   mutex_unlock_all_shards(SHARDED(&LOCK_thread_count));
+
+  // Cancel any timeouts for idle detached sessions.
+  hhWheelTimer->cancelAll();
 
   Events::deinit();
 
@@ -2333,6 +2367,8 @@ void clean_up(bool print_message)
     (void) pthread_key_delete(THR_MALLOC);
 
 #ifdef HAVE_MY_TIMER
+  hhWheelTimer.reset(nullptr);
+
   if (have_statement_timeout == SHOW_OPTION_YES)
     my_timer_deinitialize();
 
@@ -2392,6 +2428,7 @@ static void clean_up_mutexes()
 #endif
   mysql_mutex_destroy(&LOCK_log_throttle_qni);
   mysql_mutex_destroy(&LOCK_log_throttle_legacy);
+  mysql_mutex_destroy(&LOCK_log_throttle_sbr_unsafe);
   mysql_mutex_destroy(&LOCK_status);
   mysql_mutex_destroy(&LOCK_delayed_insert);
   mysql_mutex_destroy(&LOCK_delayed_status);
@@ -3153,6 +3190,17 @@ static void do_backoff(int* num_backoffs) // num_backoffs is initialized to 0
 }
 #endif
 
+static bool check_and_reset_thd_pri(THD *thd)
+{
+    if (!thd->is_thd_priority_alt())
+    {
+      return true;
+    }
+    //reset nice value of a thread
+    int rc = setpriority(PRIO_PROCESS, thd->system_thread_id, 0);
+    return rc == 0;
+}
+
 /**
   Block the current pthread for reuse by new connections.
 
@@ -3266,6 +3314,7 @@ bool one_thread_per_connection_end(THD *thd, bool block_pthread)
   ERR_remove_state(0);
 #endif
 
+  block_pthread = check_and_reset_thd_pri(thd);
   delete thd;
 
 #ifdef HAVE_PSI_THREAD_INTERFACE
@@ -3791,6 +3840,72 @@ int histogram_validate_step_size_string(const char* step_size_with_unit)
   else
     ret = 1;
   return ret;
+}
+
+bool update_thread_nice_value(char *thd_id_nice_val)
+{
+  //parse input to get thread_id and nice_val
+  std::string thd_id_nice_val_str(thd_id_nice_val);
+
+  std::size_t delimpos = thd_id_nice_val_str.find(':');
+  if (delimpos == std::string::npos)
+  {
+    return false;
+  }
+  std::string thread_id_str(thd_id_nice_val_str, 0, delimpos);
+  std::string nice_val_str(thd_id_nice_val_str, delimpos+1);
+  const char *nice_val_ptr = nice_val_str.c_str();
+  const char *thread_id_ptr = thread_id_str.c_str();
+
+  char *er;
+  long nice_val = strtol(nice_val_ptr, &er, 10);
+  if (er != nice_val_ptr + nice_val_str.length())
+      return false;
+
+  unsigned long thread_id = strtoul(thread_id_ptr, &er, 10);
+  if (er != thread_id_ptr + thread_id_str.length())
+      return false;
+
+  //Check weather nice_value is in a valid range
+  if (nice_val > 19 || nice_val < -20)
+  {
+    /* NO_LINT_DEBUG */
+    sql_print_error("Nice value %ld is outside the valid"
+        "range of -19 to 20",nice_val);
+    return false;
+  }
+
+  //Check weather thread_id is a valid active system_thread_id
+  mutex_lock_all_shards(SHARDED(&LOCK_thd_remove));
+
+  Thread_iterator it= global_thread_list->begin();
+  Thread_iterator end= global_thread_list->end();
+  for (; it != end; ++it)
+  {
+    THD *thd = *it;
+    if (thd->thread_id() == thread_id)
+    {
+      int which = PRIO_PROCESS;
+
+      int ret = setpriority(which, thd->system_thread_id, nice_val);
+      if (ret != 0)
+      {
+        /* NO_LINT_DEBUG */
+        sql_print_information("Set schedParam failed, returned "
+            "val is %d. Error %s\n", ret, strerror(errno));
+        break;
+      }
+      else
+      {
+        //Update the variable used for resetting the nice value
+        thd->mark_thd_priority_as_alt();
+        mutex_unlock_all_shards(SHARDED(&LOCK_thd_remove));
+        return true;
+      }
+    }
+  }
+  mutex_unlock_all_shards(SHARDED(&LOCK_thd_remove));
+  return false;
 }
 
 /**
@@ -4396,6 +4511,8 @@ SHOW_VAR com_status_vars[]= {
   {"alter_tablespace",     (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_ALTER_TABLESPACE]), SHOW_LONG_STATUS},
   {"alter_user",           (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_ALTER_USER]), SHOW_LONG_STATUS},
   {"analyze",              (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_ANALYZE]), SHOW_LONG_STATUS},
+  {"attach_explicit_snapshot",(char*) offsetof(STATUS_VAR,
+      com_stat[(uint) SQLCOM_ATTACH_EXPLICIT_SNAPSHOT]), SHOW_LONG_STATUS},
   {"begin",                (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_BEGIN]), SHOW_LONG_STATUS},
   {"binlog",               (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_BINLOG_BASE64_EVENT]), SHOW_LONG_STATUS},
   {"call_procedure",       (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_CALL]), SHOW_LONG_STATUS},
@@ -4410,6 +4527,8 @@ SHOW_VAR com_status_vars[]= {
   {"create_index",         (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_CREATE_INDEX]), SHOW_LONG_STATUS},
   {"create_procedure",     (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_CREATE_PROCEDURE]), SHOW_LONG_STATUS},
   {"create_server",        (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_CREATE_SERVER]), SHOW_LONG_STATUS},
+  {"create_explicit_snapshot", (char*) offsetof(STATUS_VAR,
+      com_stat[(uint) SQLCOM_CREATE_EXPLICIT_SNAPSHOT]), SHOW_LONG_STATUS},
   {"create_table",         (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_CREATE_TABLE]), SHOW_LONG_STATUS},
   {"create_trigger",       (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_CREATE_TRIGGER]), SHOW_LONG_STATUS},
   {"create_udf",           (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_CREATE_FUNCTION]), SHOW_LONG_STATUS},
@@ -4457,6 +4576,8 @@ SHOW_VAR com_status_vars[]= {
     com_stat[(uint) SQLCOM_PURGE_UUID]), SHOW_LONG_STATUS},
   {"rbr_column_names",     (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_RBR_COLUMN_NAMES]), SHOW_LONG_STATUS},
   {"release_savepoint",    (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_RELEASE_SAVEPOINT]), SHOW_LONG_STATUS},
+  {"release_explict_snapshot", (char*) offsetof(STATUS_VAR,
+      com_stat[(uint) SQLCOM_RELEASE_EXPLICIT_SNAPSHOT]), SHOW_LONG_STATUS},
   {"rename_table",         (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_RENAME_TABLE]), SHOW_LONG_STATUS},
   {"rename_user",          (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_RENAME_USER]), SHOW_LONG_STATUS},
   {"repair",               (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_REPAIR]), SHOW_LONG_STATUS},
@@ -5228,6 +5349,8 @@ static int init_thread_environment()
                    &LOCK_log_throttle_qni, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_log_throttle_legacy,
                    &LOCK_log_throttle_legacy, MY_MUTEX_INIT_FAST);
+  mysql_mutex_init(key_LOCK_log_throttle_sbr_unsafe,
+                   &LOCK_log_throttle_sbr_unsafe, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_global_table_stats,
                    &LOCK_global_table_stats, MY_MUTEX_INIT_ERRCHK);
 #ifdef HAVE_OPENSSL
@@ -5280,7 +5403,7 @@ bool init_ssl()
 {
 #ifdef HAVE_OPENSSL
 #ifndef HAVE_YASSL
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if defined(OPENSSL_IS_BORINGSSL) || OPENSSL_VERSION_NUMBER < 0x10100000L
   CRYPTO_malloc_init();
 #else
   OPENSSL_malloc_init();
@@ -5641,6 +5764,9 @@ static int init_server_components()
   }
   else
     have_statement_timeout= SHOW_OPTION_YES;
+
+  hhWheelTimer = std::unique_ptr<HHWheelTimer>(
+      new HHWheelTimer(std::chrono::milliseconds(10)));
 #else
   have_statement_timeout= SHOW_OPTION_NO;
 #endif
@@ -6487,8 +6613,6 @@ bool Per_user_session_variables::init_do(User_session_vars_sp& per_user_vars,
 */
 bool Per_user_session_variables::set_thd(THD *thd)
 {
-  thd->get_stmt_da()->reset_diagnostics_area();
-
   bool ret = true;
   std::string err_msg;
 
@@ -9360,6 +9484,10 @@ struct my_option my_long_options[]=
    "Print more attributes to the slow query log",
    (uchar**) &opt_log_slow_extra, (uchar**) &opt_log_slow_extra,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+  {"trim-binlog-to-recover", OPT_TRIM_BINLOG_TO_RECOVER,
+   "Trim the last binlog (if required) to the position until which the "
+   "engine has successfully committed all transactions.",
+   &opt_trim_binlog, &opt_trim_binlog, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
   {0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
 
@@ -9460,8 +9588,93 @@ static int show_jemalloc_mapped(THD *thd, SHOW_VAR *var, char *buff)
 {
   return show_jemalloc_sizet(thd, var, buff, "stats.mapped");
 }
+
+bool enable_jemalloc_hppfunc(char *enable_profiling_ptr)
+{
+  std::string epp(enable_profiling_ptr);
+  std::transform(epp.begin(), epp.end(), epp.begin(), ::tolower);
+
+  bool enable_profiling = epp.std::string::compare("on") == 0;
+  bool disable_profiling = epp.std::string::compare("off") == 0;
+  bool dump_profiling = epp.std::string::compare("dump") == 0;
+
+  if (enable_profiling)
+  {
+    size_t val_sz = sizeof(enable_profiling);
+    int ret = mallctl("prof.active", nullptr,
+        nullptr, &enable_profiling, val_sz);
+
+    if (ret != 0) {
+      /* NO_LINT_DEBUG */
+      sql_print_information("Unable to enable "
+          "jemalloc heap profiling. Error:  %d", ret);
+      return false;
+    }
+    return true;
+  }
+  if (disable_profiling)
+  {
+    disable_profiling = false;
+    size_t val_sz = sizeof(disable_profiling);
+    int ret = mallctl("prof.active", nullptr,
+        nullptr, &disable_profiling , val_sz);
+
+    if (ret != 0) {
+      /* NO_LINT_DEBUG */
+      sql_print_information("Unable to disable "
+          "jemalloc heap profiling. Error: %d", ret);
+      return false;
+    }
+    return true;
+  }
+  if (dump_profiling)
+  {
+    int ret = mallctl("prof.dump", nullptr, nullptr,
+        nullptr, sizeof(const char *));
+
+    if (ret != 0) {
+      /* NO_LINT_DEBUG */
+      sql_print_information("Unable to dump heap. Error:  %d", ret);
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 #endif
 #endif
+
+static inline ulonglong get_super_read_only_block_microsec(
+    std::atomic_ullong& lock_block_timer)
+{
+  ulonglong lock_wait_microsec =
+    lock_block_timer.load(std::memory_order_seq_cst);
+  if(lock_wait_microsec)
+    lock_wait_microsec =
+      (my_timer_to_microseconds_ulonglong(
+        my_timer_since(lock_wait_microsec)));
+  return lock_wait_microsec;
+}
+
+static int show_super_read_only_block_microsec(
+  THD *thd, SHOW_VAR *var, char *buff)
+{
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  ulonglong super_read_only_block_microsec =
+    get_super_read_only_block_microsec(init_global_rolock_timer);
+
+  ulonglong commit_lock_wait =
+    get_super_read_only_block_microsec(init_commit_lock_timer);
+
+  if(commit_lock_wait > super_read_only_block_microsec)
+    super_read_only_block_microsec = commit_lock_wait;
+
+  *((longlong *)buff) = super_read_only_block_microsec;
+
+  return 0;
+}
 
 static int show_queries(THD *thd, SHOW_VAR *var, char *buff)
 {
@@ -9549,30 +9762,57 @@ static int show_slave_running(THD *thd, SHOW_VAR *var, char *buff)
   return 0;
 }
 
-static int show_slave_dependency_size(THD *thd, SHOW_VAR *var, char *buff)
+static int show_slave_dependency_in_queue(THD *thd, SHOW_VAR *var, char *buff)
 {
   if (opt_mts_dependency_replication && active_mi && active_mi->rli)
   {
     var->type= SHOW_LONGLONG;
     var->value= buff;
-    mysql_mutex_lock(&active_mi->rli->dag_full_mutex);
-    *((longlong *)buff)= active_mi->rli->dag_num_groups;
-    mysql_mutex_unlock(&active_mi->rli->dag_full_mutex);
+    mysql_mutex_lock(&active_mi->rli->dep_lock);
+    *((ulonglong *)buff)= active_mi->rli->dep_queue.size();
+    mysql_mutex_unlock(&active_mi->rli->dep_lock);
   }
   else
     var->type= SHOW_UNDEF;
   return 0;
 }
 
-static int show_slave_dependency_free_size(THD *thd, SHOW_VAR *var, char *buff)
+static int show_slave_dependency_in_flight(THD *thd, SHOW_VAR *var, char *buff)
 {
   if (opt_mts_dependency_replication && active_mi && active_mi->rli)
   {
     var->type= SHOW_LONGLONG;
     var->value= buff;
-    active_mi->rli->dag_rdlock();
-    *((longlong *)buff)= (longlong) active_mi->rli->dag.get_head().size();
-    active_mi->rli->dag_unlock();
+    mysql_mutex_lock(&active_mi->rli->dep_lock);
+    *((ulonglong *)buff)= (ulonglong) active_mi->rli->num_in_flight_trx;
+    mysql_mutex_unlock(&active_mi->rli->dep_lock);
+  }
+  else
+    var->type= SHOW_UNDEF;
+  return 0;
+}
+
+static
+int show_slave_dependency_begin_waits(THD *thd, SHOW_VAR *var, char *buff)
+{
+  if (opt_mts_dependency_replication && active_mi && active_mi->rli)
+  {
+    var->type= SHOW_LONGLONG;
+    var->value= buff;
+    *((ulonglong *)buff)= (ulonglong) active_mi->rli->begin_event_waits.load();
+  }
+  else
+    var->type= SHOW_UNDEF;
+  return 0;
+}
+
+static int show_slave_dependency_next_waits(THD *thd, SHOW_VAR *var, char *buff)
+{
+  if (opt_mts_dependency_replication && active_mi && active_mi->rli)
+  {
+    var->type= SHOW_LONGLONG;
+    var->value= buff;
+    *((ulonglong *)buff)= (ulonglong) active_mi->rli->next_event_waits.load();
   }
   else
     var->type= SHOW_UNDEF;
@@ -9603,6 +9843,19 @@ static int show_slave_received_heartbeats(THD *thd, SHOW_VAR *var, char *buff)
     var->type= SHOW_LONGLONG;
     var->value= buff;
     *((longlong *)buff)= active_mi->received_heartbeats;
+  }
+  else
+    var->type= SHOW_UNDEF;
+  return 0;
+}
+
+static int show_slave_lag_sla_misses(THD *thd, SHOW_VAR *var, char *buff)
+{
+  if (active_mi && active_mi->rli)
+  {
+    var->type= SHOW_LONGLONG;
+    var->value= buff;
+    *((longlong *)buff)= slave_lag_sla_misses.load();
   }
   else
     var->type= SHOW_UNDEF;
@@ -10158,6 +10411,8 @@ SHOW_VAR status_vars[]= {
   {"Flush_commands",           (char*) &refresh_version,        SHOW_LONG_NOFLUSH},
   {"git_hash",                 (char*) git_hash, SHOW_CHAR },
   {"git_date",                 (char*) git_date, SHOW_CHAR },
+  {"super_read_only_block_microsec",
+                      (char*) &show_super_read_only_block_microsec, SHOW_FUNC},
   {"Handler_commit",           (char*) offsetof(STATUS_VAR, ha_commit_count), SHOW_LONGLONG_STATUS},
   {"Handler_delete",           (char*) offsetof(STATUS_VAR, ha_delete_count), SHOW_LONGLONG_STATUS},
   {"Handler_discover",         (char*) offsetof(STATUS_VAR, ha_discover_count), SHOW_LONGLONG_STATUS},
@@ -10298,6 +10553,7 @@ SHOW_VAR status_vars[]= {
   {"Rpl_seconds_delete_rows",  (char*) &repl_event_times[DELETE_ROWS_EVENT],   SHOW_TIMER},
   {"Rpl_seconds_incident",     (char*) &repl_event_times[INCIDENT_EVENT],      SHOW_TIMER},
   {"Compressed_event_cache_hit_ratio", (char*) &comp_event_cache_hit_ratio, SHOW_DOUBLE},
+  {"Rpl_semi_sync_master_ack_waits",  (char*) &repl_semi_sync_master_ack_waits, SHOW_LONGLONG},
 #endif
   {"rocksdb_git_hash",         (char*) rocksdb_git_hash, SHOW_CHAR },
   {"rocksdb_git_date",         (char*) rocksdb_git_date, SHOW_CHAR },
@@ -10314,13 +10570,16 @@ SHOW_VAR status_vars[]= {
   {"Slave_retried_transactions",(char*) &show_slave_retried_trans, SHOW_FUNC},
   {"Slave_heartbeat_period",   (char*) &show_heartbeat_period, SHOW_FUNC},
   {"Slave_received_heartbeats",(char*) &show_slave_received_heartbeats, SHOW_FUNC},
+  {"Slave_lag_sla_misses",     (char*) &show_slave_lag_sla_misses, SHOW_FUNC},
   {"Slave_last_heartbeat",     (char*) &show_slave_last_heartbeat, SHOW_FUNC},
 #ifndef DBUG_OFF
   {"Slave_rows_last_search_algorithm_used",(char*) &show_slave_rows_last_search_algorithm_used, SHOW_FUNC},
 #endif
   {"Slave_running",            (char*) &show_slave_running,     SHOW_FUNC},
-  {"Slave_dependency_size",      (char*) &show_slave_dependency_size, SHOW_FUNC},
-  {"Slave_dependency_free_size", (char*) &show_slave_dependency_free_size, SHOW_FUNC},
+  {"Slave_dependency_in_queue",  (char*) &show_slave_dependency_in_queue, SHOW_FUNC},
+  {"Slave_dependency_in_flight", (char*) &show_slave_dependency_in_flight, SHOW_FUNC},
+  {"Slave_dependency_begin_waits", (char*) &show_slave_dependency_begin_waits, SHOW_FUNC},
+  {"Slave_dependency_next_waits", (char*) &show_slave_dependency_next_waits, SHOW_FUNC},
 #endif
   {"Slow_launch_threads",      (char*) &slow_launch_threads,    SHOW_LONG},
   {"Slow_queries",             (char*) offsetof(STATUS_VAR, long_query_count), SHOW_LONGLONG_STATUS},
@@ -10557,6 +10816,7 @@ static int mysql_init_variables(void)
   myisam_test_invalid_symlink= test_if_data_home_dir;
   opt_log= opt_slow_log= 0;
   opt_bin_log= 0;
+  opt_trim_binlog= 0;
   opt_disable_networking= opt_skip_show_db=0;
   opt_skip_name_resolve= 0;
   opt_ignore_builtin_innodb= 0;
@@ -11166,6 +11426,9 @@ pfs_error:
     break;
   case OPT_SHOW_OLD_TEMPORALS:
     WARN_DEPRECATED_NO_REPLACEMENT(NULL, "show_old_temporals");
+    break;
+  case OPT_TRIM_BINLOG_TO_RECOVER:
+    opt_trim_binlog= 1;
     break;
   }
   return 0;
@@ -12000,7 +12263,7 @@ static int delete_shutdown_file()
   @param  flags  file operation flags
 */
 
-static void delete_pid_file(myf flags)
+void delete_pid_file(myf flags)
 {
 #ifndef EMBEDDED_LIBRARY
   File file;
@@ -12133,6 +12396,8 @@ PSI_mutex_key key_RELAYLOG_LOCK_binlog_end_pos;
 PSI_mutex_key key_LOCK_sql_rand;
 PSI_mutex_key key_gtid_ensure_index_mutex;
 PSI_mutex_key key_LOCK_thread_created;
+PSI_mutex_key key_LOCK_log_throttle_sbr_unsafe;
+
 #ifdef HAVE_MY_TIMER
 PSI_mutex_key key_thd_timer_mutex;
 #endif
@@ -12232,7 +12497,8 @@ static PSI_mutex_info all_server_mutexes[]=
 #endif
   { &key_gtid_info_run_lock, "Gtid_info::run_lock", 0},
   { &key_gtid_info_data_lock, "Gtid_info::data_lock", 0},
-  { &key_gtid_info_sleep_lock, "Gtid_info::sleep_lock", 0}
+  { &key_gtid_info_sleep_lock, "Gtid_info::sleep_lock", 0},
+  { &key_LOCK_log_throttle_sbr_unsafe, "LOCK_log_throttle_sbr_unsafe", PSI_FLAG_GLOBAL}
 };
 
 PSI_rwlock_key key_rwlock_LOCK_grant, key_rwlock_LOCK_logger,
@@ -12547,6 +12813,9 @@ PSI_stage_info stage_slave_waiting_worker_to_release_partition= { 0, "Waiting fo
 PSI_stage_info stage_slave_waiting_worker_to_free_events= { 0, "Waiting for Slave Workers to free pending events", 0};
 PSI_stage_info stage_slave_waiting_worker_queue= { 0, "Waiting for Slave Worker queue", 0};
 PSI_stage_info stage_slave_waiting_event_from_coordinator= { 0, "Waiting for an event from Coordinator", 0};
+PSI_stage_info stage_slave_waiting_for_dependencies= { 0, "Waiting for dependencies to be satisfied", 0};
+PSI_stage_info stage_slave_waiting_for_dependency_workers= { 0, "Waiting for dependency workers to finish", 0};
+PSI_stage_info stage_slave_waiting_semi_sync_ack= { 0, "Waiting for an ACK from semi-sync ACKers", 0};
 
 #ifdef HAVE_PSI_INTERFACE
 

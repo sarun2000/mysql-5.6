@@ -7138,10 +7138,10 @@ ER_CAPACITY_EXCEEDED_IN_RANGE_OPTIMIZER
 
 
 #
-# FB MySQL error codes begin from 12000
+# FB MySQL error codes begin from 50000
 #
 
-start-error-number 12000
+start-error-number 50000
 
 ER_QUERY_THROTTLED 70101
  eng "Query execution was throttled"
@@ -7279,7 +7279,7 @@ ER_ON_DUPLICATE_DISABLED
   eng "When unique checking is disabled in MyRocks, INSERT,UPDATE,LOAD statements with clauses that update or replace the key (i.e. INSERT ON DUPLICATE KEY UPDATE, REPLACE) are not allowed. Query: %s"
 
 ER_UPDATES_WITH_CONSISTENT_SNAPSHOT
-  eng "Can't execute updates when you started a transaction with START TRANSACTION WITH CONSISTENT [ROCKSDB] SNAPSHOT."
+  eng "Can't execute updates when you started a transaction with START TRANSACTION WITH CONSISTENT|SHARED|EXISTING [ROCKSDB] SNAPSHOT."
 
 ER_ROLLBACK_ONLY
   eng "This transaction was rolled back and cannot be committed. Only supported operation is to roll it back, so all pending changes will be discarded. Please restart another transaction."
@@ -7288,7 +7288,7 @@ ER_ROLLBACK_TO_SAVEPOINT
   eng "MyRocks currently does not support ROLLBACK TO SAVEPOINT if modifying rows."
 
 ER_ISOLATION_LEVEL_WITH_CONSISTENT_SNAPSHOT
-  eng "Only REPEATABLE READ isolation level is supported for START TRANSACTION WITH CONSISTENT SNAPSHOT in RocksDB Storage Engine."
+  eng "Only REPEATABLE READ isolation level is supported for START TRANSACTION WITH CONSISTENT|SHARED|EXISTING SNAPSHOT in RocksDB Storage Engine."
 
 ER_UNSUPPORTED_COLLATION
   eng "Unsupported collation on string indexed column %s.%s Use binary collation (%s)."
@@ -7304,12 +7304,6 @@ ER_SK_POPULATE_DURING_ALTER
 
 ER_CF_DIFFERENT
   eng "Column family ('%s') flag (%d) is different from an existing flag (%d). Assign a new CF flag, or do not change existing CF flag."
-
-ER_RDB_STATUS_GENERAL
-  eng "Status error %d received from RocksDB: %s"
-
-ER_RDB_STATUS_MSG
-  eng "%s, Status error %d received from RocksDB: %s"
 
 ER_RDB_TTL_UNSUPPORTED
   eng "TTL support is currently disabled when table has a hidden PK."
@@ -7346,6 +7340,42 @@ ER_DB_METADATA_INVALID_JSON
 
 ER_DB_METADATA_READ_ERROR
   eng "Error reading db metadata option: '%-.64s'"
+
+ER_UPDATES_WITH_EXPLICIT_SNAPSHOT
+  eng "Can't execute updates when an explicit snapshot is associated with the connection using CREATE|ATTACH EXPLICIT [ENGINE] SNAPSHOT"
+
+ER_RPC_MALFORMED_ID
+  eng "The specified detached session id (%s) is an unexpected format"
+
+ER_RPC_INVALID_ID
+  eng "The specified detached session id (%s) is unknown"
+
+ER_RPC_IDLE_TIMEOUT
+  eng "The specified detached session id (%s) has been removed because it was idle %ums"
+
+ER_RPC_HOST_MISMATCH
+  eng "The client attempting to use a detached session (%s) is not the one that created it"
+
+ER_RPC_SESSION_OPEN
+  eng "Failed to open a new detached session"
+
+ER_RPC_NO_PERMISSION
+  eng "User %s does not have PROXY privilege for user %s"
+
+ER_RPC_FAILED_TO_SWITCH_USER
+  eng "Failed to switch to the proxied user (%s)"
+
+ER_RPC_FAILED_TO_SWITCH_DB
+  eng "Failed to switch to the proxied user's database (%s)"
+
+ER_RPC_FAILED_TO_ATTACH
+  eng "Session already in use by another query"
+
+ER_RPC_FAILED_TO_STORE_DETACHED_SESSION
+  eng "Failed to store the detached session"
+
+ER_FULL_SCAN_DISABLED
+  eng "Full table/index scan is disabled"
 
 #
 #  End of 5.6 error messages.
